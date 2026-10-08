@@ -393,6 +393,16 @@ func (m *Method) newUDPSession() *udpSession {
 }
 
 func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	err := c.sealPacket(buffer, destination)
+	if err != nil {
+		return err
+	}
+	return c.writer.WriteBuffer(buffer)
+}
+
+// sealPacket turns buffer into one complete encrypted client packet in
+// place: header in the front headroom, AEAD tag in the rear headroom.
+func (c *clientPacketConn) sealPacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	var hdrLen int
 	if c.method.udpCipher != nil {
 		hdrLen = PacketNonceSize
@@ -472,7 +482,7 @@ func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksad
 		buffer.Extend(shadowio.Overhead)
 		c.method.udpBlockEncryptCipher.Encrypt(packetHeader, packetHeader)
 	}
-	return c.writer.WriteBuffer(buffer)
+	return nil
 }
 
 func (c *clientPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
