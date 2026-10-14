@@ -49,6 +49,7 @@ func (w *clientPacketReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions)
 }
 
 func (w *clientPacketReadWaiter) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
+	w.gro.leave()
 	buffer, err = w.readWaiter.WaitReadBuffer()
 	if err != nil {
 		return

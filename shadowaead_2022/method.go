@@ -368,6 +368,7 @@ type clientPacketConn struct {
 	writer  N.ExtendedWriter
 	method  *Method
 	session *udpSession
+	gro     groState // packet_batch_read_gro_linux.go
 }
 
 func (m *Method) newUDPSession() *udpSession {
@@ -486,6 +487,7 @@ func (c *clientPacketConn) sealPacket(buffer *buf.Buffer, destination M.Socksadd
 }
 
 func (c *clientPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
+	c.gro.leave()
 	err = c.reader.ReadBuffer(buffer)
 	if err != nil {
 		return
@@ -624,6 +626,7 @@ func (c *clientPacketConn) readPacket(buffer *buf.Buffer) (destination M.Socksad
 }
 
 func (c *clientPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	c.gro.leave()
 	n, err = c.reader.Read(p)
 	if err != nil {
 		return

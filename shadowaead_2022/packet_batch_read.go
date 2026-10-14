@@ -38,6 +38,10 @@ import (
 // using the single-packet read waiter.
 //
 // SS2_DISABLE_UDP_BATCH_READ=1 turns it off (for A/B tests).
+//
+// On Linux the first batch read also switches the socket to UDP_GRO, so the
+// datagrams the network already coalesced arrive whole and are split here
+// (packet_batch_read_gro_linux.go, SS2_DISABLE_UDP_GRO=1 to keep it off).
 
 var disableUDPBatchRead = os.Getenv("SS2_DISABLE_UDP_BATCH_READ") == "1"
 
@@ -47,25 +51,54 @@ func (c *clientPacketConn) CreatePacketBatchReadWaiter() (N.PacketBatchReadWaite
 	if disableUDPBatchRead {
 		return nil, false
 	}
-	reader, created := bufio.CreateConnectedPacketBatchReadWaiter(&clientSocketReader{c.reader})
+	socketReader := &clientSocketReader{c.reader}
+	reader, created := bufio.CreateConnectedPacketBatchReadWaiter(socketReader)
 	if !created {
 		return nil, false
 	}
-	return &clientPacketBatchReadWaiter{conn: c, reader: reader}, true
+	rawConn, _ := socketReader.SyscallConn()
+	return &clientPacketBatchReadWaiter{conn: c, reader: reader, rawConn: rawConn}, true
 }
 
 type clientPacketBatchReadWaiter struct {
-	conn   *clientPacketConn
-	reader N.ConnectedPacketBatchReadWaiter
+	conn    *clientPacketConn
+	reader  N.ConnectedPacketBatchReadWaiter
+	options N.ReadWaitOptions
+
+	// UDP_GRO (packet_batch_read_gro_linux.go): tried on the first read,
+	// gro is the splitting reader if the socket accepted it.
+	rawConn  syscall.RawConn
+	groTried bool
+	gro      N.ConnectedPacketBatchReadWaiter
 }
 
 func (w *clientPacketBatchReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	w.options = options
+	if w.gro != nil {
+		w.gro.InitializeReadWaiter(options)
+	}
 	return w.reader.InitializeReadWaiter(options)
 }
 
+func (w *clientPacketBatchReadWaiter) batchReader() N.ConnectedPacketBatchReadWaiter {
+	if !w.groTried {
+		w.groTried = true
+		if w.rawConn != nil {
+			w.gro = newGROBatchReader(w.conn, w.rawConn, w.options)
+		}
+	}
+	if w.gro != nil {
+		// stays in use after a single read turned UDP_GRO off: an entry
+		// without the UDP_GRO cmsg is one datagram
+		return w.gro
+	}
+	return w.reader
+}
+
 func (w *clientPacketBatchReadWaiter) WaitReadPackets() (buffers []*buf.Buffer, destinations []M.Socksaddr, err error) {
+	reader := w.batchReader()
 	for {
-		buffers, _, err = w.reader.WaitReadConnectedPackets()
+		buffers, _, err = reader.WaitReadConnectedPackets()
 		if err != nil {
 			return nil, nil, err
 		}
