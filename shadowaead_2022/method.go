@@ -513,12 +513,15 @@ func (c *clientPacketConn) readPacket(buffer *buf.Buffer) (destination M.Socksad
 		c.method.udpBlockDecryptCipher.Decrypt(packetHeader, packetHeader)
 	}
 
-	var sessionId, packetId uint64
-	err = binary.Read(buffer, binary.BigEndian, &sessionId)
+	// Header fields are read straight from the buffer (readUint64/readUint16
+	// in packet_header.go): binary.Read goes through reflection and
+	// allocates, which was 3.5% of sing-box CPU during an HTTP/3 download on
+	// the daily phone (2026-10-14).
+	sessionId, err := readUint64(buffer)
 	if err != nil {
 		return M.Socksaddr{}, err
 	}
-	err = binary.Read(buffer, binary.BigEndian, &packetId)
+	packetId, err := readUint64(buffer)
 	if err != nil {
 		return M.Socksaddr{}, err
 	}
@@ -563,13 +566,14 @@ func (c *clientPacketConn) readPacket(buffer *buf.Buffer) (destination M.Socksad
 		return M.Socksaddr{}, E.Extend(ErrBadHeaderType, "expected ", HeaderTypeServer, ", got ", headerType)
 	}
 
-	var epoch uint64
-	err = binary.Read(buffer, binary.BigEndian, &epoch)
+	epoch, err := readUint64(buffer)
 	if err != nil {
 		return M.Socksaddr{}, err
 	}
 
-	diff := int(math.Abs(float64(c.method.time().Unix() - int64(epoch))))
+	// one clock read per packet (the ntp-backed time function is not free)
+	now := c.method.time().Unix()
+	diff := int(math.Abs(float64(now - int64(epoch))))
 	if diff > 30 {
 		return M.Socksaddr{}, E.Extend(ErrBadTimestamp, "received ", epoch, ", diff ", diff, "s")
 	}
@@ -578,15 +582,15 @@ func (c *clientPacketConn) readPacket(buffer *buf.Buffer) (destination M.Socksad
 		c.session.window.Add(packetId)
 	} else if sessionId == c.session.lastRemoteSessionId {
 		c.session.lastWindow.Add(packetId)
-		c.session.lastRemoteSeen = c.method.time().Unix()
+		c.session.lastRemoteSeen = now
 	} else {
 		if c.session.remoteSessionId != 0 {
-			if c.method.time().Unix()-c.session.lastRemoteSeen < 60 {
+			if now-c.session.lastRemoteSeen < 60 {
 				return M.Socksaddr{}, ErrTooManyServerSessions
 			} else {
 				c.session.lastRemoteSessionId = c.session.remoteSessionId
 				c.session.lastWindow = c.session.window
-				c.session.lastRemoteSeen = c.method.time().Unix()
+				c.session.lastRemoteSeen = now
 				c.session.lastRemoteCipher = c.session.remoteCipher
 				c.session.window = SlidingWindow{}
 			}
@@ -596,8 +600,7 @@ func (c *clientPacketConn) readPacket(buffer *buf.Buffer) (destination M.Socksad
 		c.session.window.Add(packetId)
 	}
 
-	var clientSessionId uint64
-	err = binary.Read(buffer, binary.BigEndian, &clientSessionId)
+	clientSessionId, err := readUint64(buffer)
 	if err != nil {
 		return M.Socksaddr{}, err
 	}
@@ -606,8 +609,7 @@ func (c *clientPacketConn) readPacket(buffer *buf.Buffer) (destination M.Socksad
 		return M.Socksaddr{}, ErrBadClientSessionId
 	}
 
-	var paddingLen uint16
-	err = binary.Read(buffer, binary.BigEndian, &paddingLen)
+	paddingLen, err := readUint16(buffer)
 	if err != nil {
 		return M.Socksaddr{}, E.Cause(err, "read padding length")
 	}
