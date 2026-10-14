@@ -47,7 +47,14 @@ func (c *clientPacketConn) CreatePacketBatchReadWaiter() (N.PacketBatchReadWaite
 	if disableUDPBatchRead {
 		return nil, false
 	}
-	reader, created := bufio.CreateConnectedPacketBatchReadWaiter(&clientSocketReader{c.reader})
+	socketReader := &clientSocketReader{c.reader}
+	if rawConn, err := socketReader.SyscallConn(); err == nil {
+		// keeps unfilled recvmmsg buffers (packet_batch_read_keep_linux.go)
+		if reader := newKeptBatchReader(rawConn); reader != nil {
+			return &clientPacketBatchReadWaiter{conn: c, reader: reader}, true
+		}
+	}
+	reader, created := bufio.CreateConnectedPacketBatchReadWaiter(socketReader)
 	if !created {
 		return nil, false
 	}

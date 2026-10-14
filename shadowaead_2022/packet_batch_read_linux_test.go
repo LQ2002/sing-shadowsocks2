@@ -154,3 +154,56 @@ func TestClientPacketBatchReadWaiterUnconnected(t *testing.T) {
 		t.Fatal("batch read waiter created for an unconnected socket")
 	}
 }
+
+// The batch waiter reads through keptBatchReader, which keeps the packet
+// buffers recvmmsg left empty for the next read instead of releasing them,
+// and frees them all when re-initialised.
+func TestClientPacketBatchReadKeepsBuffers(t *testing.T) {
+	server, client, conn := newTestBatchPair(t)
+	defer server.Close()
+	defer client.Close()
+	waiter, created := conn.CreatePacketBatchReadWaiter()
+	if !created {
+		t.Fatal("batch read waiter not created")
+	}
+	kept, isKept := waiter.(*clientPacketBatchReadWaiter).reader.(*keptBatchReader)
+	if !isKept {
+		t.Fatalf("reader is %T, want *keptBatchReader", waiter.(*clientPacketBatchReadWaiter).reader)
+	}
+	waiter.InitializeReadWaiter(N.ReadWaitOptions{MTU: 65535, BatchSize: 16})
+	source := M.ParseSocksaddrHostPort("1.2.3.4", 443)
+	var spare []*buf.Buffer
+	for round := 0; round < 3; round++ {
+		packet := newTestServerPacket(t, conn, 9, uint64(round), source, []byte("payload"))
+		if _, err := server.WriteToUDP(packet, client.LocalAddr().(*net.UDPAddr)); err != nil {
+			t.Fatal(err)
+		}
+		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		buffers, _, err := waiter.WaitReadPackets()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(buffers) != 1 || string(buffers[0].Bytes()) != "payload" {
+			t.Fatalf("round %d: got %d packets", round, len(buffers))
+		}
+		buf.ReleaseMulti(buffers)
+		if kept.buffers[0] != nil {
+			t.Fatal("slot handed to the caller was not cleared")
+		}
+		for index := 1; index < len(kept.buffers); index++ {
+			if kept.buffers[index] == nil {
+				t.Fatalf("round %d: unfilled slot %d was released", round, index)
+			}
+			if round > 0 && kept.buffers[index] != spare[index] {
+				t.Fatalf("round %d: unfilled slot %d was replaced", round, index)
+			}
+		}
+		spare = append(spare[:0], kept.buffers...)
+	}
+	waiter.InitializeReadWaiter(N.ReadWaitOptions{MTU: 65535, BatchSize: 16})
+	for index, buffer := range kept.buffers {
+		if buffer != nil {
+			t.Fatalf("slot %d still held after re-initialising", index)
+		}
+	}
+}
