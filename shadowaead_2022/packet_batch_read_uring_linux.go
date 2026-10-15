@@ -56,6 +56,14 @@ var enableUDPIOUring = os.Getenv("SS2_UDP_IOURING") == "1"
 // netpoller's; the variant trades that for no dedicated thread per reader.
 // SS2_UDP_IOURING_COOP=1 adds IORING_SETUP_COOP_TASKRUN (task_work notified
 // without an IPI; a sleeping arming thread is still woken).
+//
+// With SS2_UDP_GRO=1 as well the socket gets UDP_GRO (see
+// packet_batch_read_gro_linux.go): the receive reserves room for the
+// UDP_GRO cmsg and the ring buffers are 64 KiB, since a merged datagram is
+// truncated (lost) in a smaller one. To bound memory there are only
+// uringGROBufferCount of them; when all are in use the multishot receive
+// ends with ENOBUFS, the datagrams stay queued on the socket, and the
+// receive is re-armed once the buffers are back.
 var (
 	udpIOUringNetpoll = os.Getenv("SS2_UDP_IOURING_WAIT") == "netpoll"
 	udpIOUringCoop    = os.Getenv("SS2_UDP_IOURING_COOP") == "1"
@@ -66,6 +74,9 @@ const (
 	uringBufferGroup = 7
 	uringBufferCount = 64   // power of two
 	uringBufferSize  = 2048 // recvmsg_out header + one datagram
+	// UDP_GRO: recvmsg_out header + reserved cmsg room + a merged datagram
+	uringGROBufferCount = 8 // power of two
+	uringGROBufferSize  = uringRecvOutSize + groControlSize + groSlotSize
 	uringRecvOutSize = 16   // struct io_uring_recvmsg_out
 	uringSQEntries   = 8
 	uringCQEntries   = 256
@@ -178,6 +189,13 @@ type uringBatchReader struct {
 	cqes    unsafe.Pointer
 	sqFlags *uint32
 	bufTail uint16
+	// gro: UDP_GRO is on for the socket; bufCount/bufSize are the ring
+	// buffers' (uringBuffer* or uringGROBuffer*), control the cmsg room
+	// reserved in front of each payload
+	gro      bool
+	bufCount int
+	bufSize  int
+	control  int
 	// netpoll variant: the ring fd as an *os.File registered with the Go
 	// netpoller, and its RawConn
 	ringFile *os.File
@@ -215,7 +233,14 @@ func newUringBatchReader(rawConn syscall.RawConn) (N.ConnectedPacketBatchReadWai
 	if err != nil || !destination.IsValid() || fd < 0 {
 		return nil, nil
 	}
-	reader := &uringBatchReader{rawConn: rawConn, fd: fd, destination: destination, ringFD: -1}
+	reader := &uringBatchReader{rawConn: rawConn, fd: fd, destination: destination, ringFD: -1,
+		bufCount: uringBufferCount, bufSize: uringBufferSize}
+	if enableUDPGRO && unix.SetsockoptInt(fd, unix.SOL_UDP, unix.UDP_GRO, 1) == nil {
+		reader.gro = true
+		reader.bufCount = uringGROBufferCount
+		reader.bufSize = uringGROBufferSize
+		reader.control = groControlSize
+	}
 	return reader, reader.shutdown
 }
 
@@ -299,22 +324,25 @@ func (r *uringBatchReader) setup() error {
 	r.cqes = unsafe.Add(base, params.cqOff.cqes)
 	r.sqFlags = (*uint32)(unsafe.Add(base, params.sqOff.flags))
 
-	bufRing, err := unix.Mmap(-1, 0, uringBufferCount*int(unsafe.Sizeof(uringBuf{})), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
+	bufRing, err := unix.Mmap(-1, 0, r.bufCount*int(unsafe.Sizeof(uringBuf{})), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
 	if err != nil {
 		return E.Cause(err, "mmap io_uring buffer ring")
 	}
 	r.bufRing = bufRing
-	r.slab = make([]byte, uringBufferCount*uringBufferSize)
+	r.slab = make([]byte, r.bufCount*r.bufSize)
+	if r.control > 0 {
+		r.msghdr.SetControllen(r.control)
+	}
 	reg := uringBufRegister{
 		ringAddr:    uint64(uintptr(unsafe.Pointer(&bufRing[0]))),
-		ringEntries: uringBufferCount,
+		ringEntries: uint32(r.bufCount),
 		bgid:        uringBufferGroup,
 	}
 	_, _, errno = unix.Syscall6(sysIOURingReg, uintptr(r.ringFD), registerPbufRing, uintptr(unsafe.Pointer(&reg)), 1, 0, 0)
 	if errno != 0 {
 		return os.NewSyscallError("io_uring_register(PBUF_RING)", errno)
 	}
-	for bid := range uringBufferCount {
+	for bid := range r.bufCount {
 		r.provide(uint16(bid))
 	}
 	r.publishBuffers()
@@ -322,15 +350,15 @@ func (r *uringBatchReader) setup() error {
 }
 
 func (r *uringBatchReader) bufEntry(index uint16) *uringBuf {
-	return (*uringBuf)(unsafe.Add(unsafe.Pointer(&r.bufRing[0]), uintptr(index&(uringBufferCount-1))*unsafe.Sizeof(uringBuf{})))
+	return (*uringBuf)(unsafe.Add(unsafe.Pointer(&r.bufRing[0]), uintptr(int(index)&(r.bufCount-1))*unsafe.Sizeof(uringBuf{})))
 }
 
 // provide queues ring buffer bid for the kernel; publishBuffers makes the
 // queued entries visible by storing the new tail.
 func (r *uringBatchReader) provide(bid uint16) {
 	entry := r.bufEntry(r.bufTail)
-	entry.addr = uint64(uintptr(unsafe.Pointer(&r.slab[int(bid)*uringBufferSize])))
-	entry.len = uringBufferSize
+	entry.addr = uint64(uintptr(unsafe.Pointer(&r.slab[int(bid)*r.bufSize])))
+	entry.len = uint32(r.bufSize)
 	// Entry 0's bid shares a 32-bit word with the ring tail; publishBuffers
 	// stores that word whole.
 	entry.bid = bid
@@ -466,21 +494,36 @@ func (r *uringBatchReader) reap() error {
 		}
 		if cqe.flags&cqeFBuffer != 0 {
 			bid := uint16(cqe.flags >> cqeBufferShift)
-			if cqe.res >= uringRecvOutSize {
-				data := r.slab[int(bid)*uringBufferSize : int(bid)*uringBufferSize+int(cqe.res)]
+			// buffer: recvmsg_out | cmsg room (r.control) | payload
+			payloadAt := uringRecvOutSize + r.control
+			if int(cqe.res) >= payloadAt {
+				data := r.slab[int(bid)*r.bufSize : int(bid)*r.bufSize+int(cqe.res)]
+				controlLen := int(*(*uint32)(unsafe.Pointer(&data[4])))
 				payloadLen := int(*(*uint32)(unsafe.Pointer(&data[8])))
 				msgFlags := *(*uint32)(unsafe.Pointer(&data[12]))
-				if msgFlags&unix.MSG_TRUNC == 0 && uringRecvOutSize+payloadLen <= len(data) {
+				if msgFlags&unix.MSG_TRUNC == 0 && payloadAt+payloadLen <= len(data) {
 					if payloadLen == 0 && r.closed.Load() {
 						r.eof = true
 					} else {
-						buffer := r.options.NewPacketBuffer()
-						if payloadLen <= buffer.FreeLen() {
-							copy(buffer.Extend(payloadLen), data[uringRecvOutSize:uringRecvOutSize+payloadLen])
-							r.options.PostReturn(buffer)
-							r.pending = append(r.pending, buffer)
-						} else {
-							buffer.Release()
+						payload := data[payloadAt : payloadAt+payloadLen]
+						segment := 0
+						if r.gro && controlLen > 0 && controlLen <= r.control {
+							segment = groSegmentSize(data[uringRecvOutSize : uringRecvOutSize+controlLen])
+						}
+						if segment <= 0 {
+							segment = len(payload)
+						}
+						for len(payload) > 0 {
+							piece := payload[:min(segment, len(payload))]
+							payload = payload[len(piece):]
+							buffer := r.options.NewPacketBuffer()
+							if len(piece) <= buffer.FreeLen() {
+								copy(buffer.Extend(len(piece)), piece)
+								r.options.PostReturn(buffer)
+								r.pending = append(r.pending, buffer)
+							} else {
+								buffer.Release()
+							}
 						}
 					}
 				}

@@ -73,30 +73,28 @@ func TestUDPGROLoopbackMerges(t *testing.T) {
 
 // Merged datagrams are cut at the segment size (last piece shorter), every
 // piece is opened on its own and in order, a piece that fails to open is
-// dropped, and a datagram that was not merged passes as is.
-func TestGROBatchReader(t *testing.T) {
-	enableUDPGRO = true
-	defer func() { enableUDPGRO = false }()
+// dropped, and a datagram that was not merged passes as is. Three merged
+// sends and twelve single datagrams are more messages than the io_uring
+// reader has GRO buffers, so its ENOBUFS re-arm is exercised too.
+func testGROReader(t *testing.T, check func(t *testing.T, reader N.ConnectedPacketBatchReadWaiter)) {
 	server, client, conn := newTestBatchPair(t)
 	defer server.Close()
 	defer client.Close()
+	_ = client.SetReadBuffer(4 << 20)
 
 	waiter, created := conn.CreatePacketBatchReadWaiter()
 	if !created {
 		t.Fatal("batch read waiter not created")
 	}
-	if _, isGRO := waiter.(*clientPacketBatchReadWaiter).reader.(*groBatchReader); !isGRO {
-		t.Fatal("SS2_UDP_GRO did not select the GRO reader")
-	}
+	check(t, waiter.(*clientPacketBatchReadWaiter).reader)
 	waiter.InitializeReadWaiter(N.ReadWaitOptions{MTU: 65535, BatchSize: 64})
 
 	source := M.ParseSocksaddrHostPort("1.2.3.4", 443)
 	clientAddr := client.LocalAddr().(*net.UDPAddr)
 	const segment = 1350
 	var (
-		want    [][]byte
-		packets [][]byte
-		id      uint64
+		want [][]byte
+		id   uint64
 	)
 	seal := func(size int, broken bool) []byte {
 		payload := make([]byte, size-sip022Overhead)
@@ -113,13 +111,18 @@ func TestGROBatchReader(t *testing.T) {
 		}
 		return packet
 	}
-	for index := 0; index < 6; index++ {
-		packets = append(packets, seal(segment, index == 2))
+	for group := 0; group < 3; group++ {
+		var packets [][]byte
+		for index := 0; index < 6; index++ {
+			packets = append(packets, seal(segment, group == 0 && index == 2))
+		}
+		packets = append(packets, seal(700, false))
+		sendGSO(t, server, clientAddr, segment, packets)
 	}
-	packets = append(packets, seal(700, false))
-	sendGSO(t, server, clientAddr, segment, packets)
-	if _, err := server.WriteToUDP(seal(900, false), clientAddr); err != nil {
-		t.Fatal(err)
+	for index := 0; index < 12; index++ {
+		if _, err := server.WriteToUDP(seal(900+index, false), clientAddr); err != nil {
+			t.Fatal(err)
+		}
 	}
 	time.Sleep(50 * time.Millisecond)
 
@@ -146,4 +149,30 @@ func TestGROBatchReader(t *testing.T) {
 			t.Fatalf("packet %d: payload mismatch", index)
 		}
 	}
+	_ = conn.Close()
+}
+
+func TestGROBatchReader(t *testing.T) {
+	enableUDPGRO = true
+	defer func() { enableUDPGRO = false }()
+	testGROReader(t, func(t *testing.T, reader N.ConnectedPacketBatchReadWaiter) {
+		if _, isGRO := reader.(*groBatchReader); !isGRO {
+			t.Fatal("SS2_UDP_GRO did not select the GRO reader")
+		}
+	})
+}
+
+func TestUringBatchReaderGRO(t *testing.T) {
+	enableUDPGRO = true
+	enableUDPIOUring = true
+	defer func() { enableUDPGRO, enableUDPIOUring = false, false }()
+	testGROReader(t, func(t *testing.T, reader N.ConnectedPacketBatchReadWaiter) {
+		uring, isUring := reader.(*uringBatchReader)
+		if !isUring {
+			t.Fatal("SS2_UDP_IOURING did not select the io_uring reader")
+		}
+		if !uring.gro {
+			t.Fatal("io_uring reader without UDP_GRO")
+		}
+	})
 }
