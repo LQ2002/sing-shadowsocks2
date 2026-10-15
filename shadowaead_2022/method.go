@@ -375,6 +375,8 @@ type clientPacketConn struct {
 	// writerCloseHook releases the io_uring batch writer's ring
 	// (packet_batch_write_uring_linux.go).
 	writerCloseHook atomic.Pointer[func()]
+	// pathMTU: oversized datagrams are dropped, not fatal (packet_mtu.go)
+	pathMTU pathMTULimit
 }
 
 func (m *Method) newUDPSession() *udpSession {
@@ -404,7 +406,17 @@ func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksad
 	if err != nil {
 		return err
 	}
-	return c.writer.WriteBuffer(buffer)
+	if c.tooBig(buffer.Len()) {
+		buffer.Release()
+		return nil
+	}
+	err = c.writer.WriteBuffer(buffer)
+	if isMessageTooLong(err) {
+		// dropped, see packet_mtu.go
+		c.refreshPathMTU()
+		return nil
+	}
+	return err
 }
 
 // sealPacket turns buffer into one complete encrypted client packet in
@@ -494,6 +506,10 @@ func (c *clientPacketConn) sealPacket(buffer *buf.Buffer, destination M.Socksadd
 
 func (c *clientPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
 	err = c.reader.ReadBuffer(buffer)
+	for isMessageTooLong(err) {
+		// an ICMP "fragmentation needed" reported on the socket (packet_mtu.go)
+		err = c.reader.ReadBuffer(buffer)
+	}
 	if err != nil {
 		return
 	}
@@ -632,6 +648,9 @@ func (c *clientPacketConn) readPacket(buffer *buf.Buffer) (destination M.Socksad
 
 func (c *clientPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	n, err = c.reader.Read(p)
+	for isMessageTooLong(err) {
+		n, err = c.reader.Read(p)
+	}
 	if err != nil {
 		return
 	}

@@ -537,6 +537,9 @@ func (r *uringBatchReader) reap() error {
 			r.eof = true
 		case cqe.res == -int32(unix.ENOBUFS):
 			// every ring buffer was in use; they are back now, re-arm
+		case cqe.res == -int32(unix.EMSGSIZE):
+			// an ICMP "fragmentation needed" reported on the socket, not a
+			// read failure (packet_mtu.go); re-arm if the receive ended
 		case cqe.res < 0:
 			if reapErr == nil {
 				reapErr = os.NewSyscallError("io_uring recvmsg", syscall.Errno(-cqe.res))

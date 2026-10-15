@@ -147,7 +147,9 @@ func (r *groBatchReader) read(fd uintptr) (done bool) {
 		switch errno {
 		case 0:
 			count = int(n)
-		case syscall.EINTR:
+		case syscall.EINTR, syscall.EMSGSIZE:
+			// EMSGSIZE: an ICMP "fragmentation needed" reported on the
+			// socket, not a read failure (packet_mtu.go)
 			continue
 		case syscall.EAGAIN:
 			return false
