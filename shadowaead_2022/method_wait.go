@@ -50,6 +50,10 @@ func (w *clientPacketReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions)
 
 func (w *clientPacketReadWaiter) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
 	buffer, err = w.readWaiter.WaitReadBuffer()
+	for isMessageTooLong(err) {
+		// an ICMP "fragmentation needed" reported on the socket (packet_mtu.go)
+		buffer, err = w.readWaiter.WaitReadBuffer()
+	}
 	if err != nil {
 		return
 	}

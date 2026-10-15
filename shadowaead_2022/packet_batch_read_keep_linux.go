@@ -104,7 +104,9 @@ func (r *keptBatchReader) read(fd uintptr) (done bool) {
 		case 0:
 			r.readN = int(n)
 			r.readErr = nil
-		case syscall.EINTR:
+		case syscall.EINTR, syscall.EMSGSIZE:
+			// EMSGSIZE: an ICMP "fragmentation needed" reported on the
+			// socket, not a read failure (packet_mtu.go)
 			continue
 		case syscall.EAGAIN:
 			// unfilled buffers stay for the next call

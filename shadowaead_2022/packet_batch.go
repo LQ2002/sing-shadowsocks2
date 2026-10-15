@@ -63,8 +63,31 @@ func (w *clientPacketBatchWriter) WritePacketBatch(buffers []*buf.Buffer, destin
 			return err
 		}
 	}
+	// Datagrams known not to fit the path are dropped (packet_mtu.go).
+	if w.conn.pathMTU.limit.Load() != 0 {
+		kept := buffers[:0]
+		for _, buffer := range buffers {
+			if w.conn.tooBig(buffer.Len()) {
+				buffer.Release()
+				continue
+			}
+			kept = append(kept, buffer)
+		}
+		clear(buffers[len(kept):])
+		if len(kept) == 0 {
+			return nil
+		}
+		buffers = kept
+	}
 	// Takes ownership of the buffers and releases them.
-	return w.writer.WriteConnectedPacketBatch(buffers)
+	err := w.writer.WriteConnectedPacketBatch(buffers)
+	if isMessageTooLong(err) {
+		// The first oversized datagram ends the batch (the ones after it are
+		// lost once); later batches are filtered above.
+		w.conn.refreshPathMTU()
+		return nil
+	}
+	return err
 }
 
 // clientSocketWriter presents the client's underlying conn to sing's batch
