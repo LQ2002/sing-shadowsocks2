@@ -20,7 +20,7 @@ import (
 )
 
 // uringBatchReader is an io_uring alternative to keptBatchReader for the
-// client's connected UDP socket (experiment, opt-in: SS2_UDP_IOURING=1).
+// client's connected UDP socket (default on; SS2_UDP_IOURING=0 turns it off).
 //
 // One multishot IORING_OP_RECVMSG is armed on the socket with a provided
 // buffer ring, so every datagram that arrives lands in a ring buffer without
@@ -45,7 +45,10 @@ import (
 // reader blocked in io_uring_enter gets an IORING_OP_ASYNC_CANCEL for its
 // receive and returns io.EOF; an idle reader's ring is closed outright.
 
-var enableUDPIOUring = os.Getenv("SS2_UDP_IOURING") == "1"
+// On by default since 2026-10-16 (see enableUDPGRO for the numbers); when
+// io_uring cannot be set up the reader falls back to recvmmsg on its own.
+// SS2_UDP_IOURING=0 turns it off.
+var enableUDPIOUring = os.Getenv("SS2_UDP_IOURING") != "0"
 
 // Wait variants (experiment). SS2_UDP_IOURING_WAIT=netpoll: the reader does
 // not lock its thread or block in io_uring_enter; the ring fd (pollable:
@@ -57,7 +60,7 @@ var enableUDPIOUring = os.Getenv("SS2_UDP_IOURING") == "1"
 // SS2_UDP_IOURING_COOP=1 adds IORING_SETUP_COOP_TASKRUN (task_work notified
 // without an IPI; a sleeping arming thread is still woken).
 //
-// With SS2_UDP_GRO=1 as well the socket gets UDP_GRO (see
+// With UDP_GRO on as well the socket gets UDP_GRO (see
 // packet_batch_read_gro_linux.go): the receive reserves room for the
 // UDP_GRO cmsg and the ring buffers are 64 KiB, since a merged datagram is
 // truncated (lost) in a smaller one. To bound memory there are only
@@ -236,7 +239,7 @@ func uringAvailable() bool {
 }
 
 // newUringBatchReader returns the reader and the function the conn's Close
-// must call, or nil when SS2_UDP_IOURING is not set or the socket is not
+// must call, or nil when SS2_UDP_IOURING=0 or the socket is not
 // connected.
 func newUringBatchReader(rawConn syscall.RawConn) (N.ConnectedPacketBatchReadWaiter, func()) {
 	if !enableUDPIOUring || !uringAvailable() {

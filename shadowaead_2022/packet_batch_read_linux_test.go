@@ -47,6 +47,15 @@ func newTestServerPacket(t *testing.T, conn *clientPacketConn, serverSessionID, 
 	return append(header, sealed...)
 }
 
+// useReaders selects the client's read path for one test (io_uring and
+// UDP_GRO are on by default) and restores the previous choice after it.
+func useReaders(t *testing.T, uring, gro bool) {
+	t.Helper()
+	oldURing, oldGRO := enableUDPIOUring, enableUDPGRO
+	enableUDPIOUring, enableUDPGRO = uring, gro
+	t.Cleanup(func() { enableUDPIOUring, enableUDPGRO = oldURing, oldGRO })
+}
+
 func newTestBatchPair(t *testing.T) (*net.UDPConn, *net.UDPConn, *clientPacketConn) {
 	t.Helper()
 	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -64,6 +73,7 @@ func newTestBatchPair(t *testing.T) (*net.UDPConn, *net.UDPConn, *clientPacketCo
 // and in order; a datagram that fails to open is dropped from the batch
 // instead of failing it.
 func TestClientPacketBatchReadWaiter(t *testing.T) {
+	useReaders(t, false, false)
 	server, client, conn := newTestBatchPair(t)
 	defer server.Close()
 	defer client.Close()
@@ -123,6 +133,7 @@ func TestClientPacketBatchReadWaiter(t *testing.T) {
 // A batch in which nothing opens fails with the open error, as a single read
 // of that datagram did.
 func TestClientPacketBatchReadWaiterAllInvalid(t *testing.T) {
+	useReaders(t, false, false)
 	server, client, conn := newTestBatchPair(t)
 	defer server.Close()
 	defer client.Close()
@@ -144,6 +155,7 @@ func TestClientPacketBatchReadWaiterAllInvalid(t *testing.T) {
 
 // Without a connected socket there is nothing to read in batches.
 func TestClientPacketBatchReadWaiterUnconnected(t *testing.T) {
+	useReaders(t, false, false)
 	socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -159,6 +171,7 @@ func TestClientPacketBatchReadWaiterUnconnected(t *testing.T) {
 // buffers recvmmsg left empty for the next read instead of releasing them,
 // and frees them all when re-initialised.
 func TestClientPacketBatchReadKeepsBuffers(t *testing.T) {
+	useReaders(t, false, false)
 	server, client, conn := newTestBatchPair(t)
 	defer server.Close()
 	defer client.Close()
@@ -210,6 +223,7 @@ func TestClientPacketBatchReadKeepsBuffers(t *testing.T) {
 
 // The blocking-ppoll control variant must read the same way.
 func TestClientPacketBatchReadBlockingVariant(t *testing.T) {
+	useReaders(t, false, false)
 	udpBlockingRead = true
 	defer func() { udpBlockingRead = false }()
 	t.Run("waiter", TestClientPacketBatchReadWaiter)

@@ -64,8 +64,7 @@ func newUringTestPair(t *testing.T) (*net.UDPConn, *net.UDPConn, *uringBatchRead
 	if err != nil {
 		t.Fatal(err)
 	}
-	enableUDPIOUring = true
-	t.Cleanup(func() { enableUDPIOUring = false })
+	useReaders(t, true, false)
 	waiter, shutdown := newUringBatchReader(rawConn)
 	if waiter == nil {
 		t.Skip("io_uring reader unavailable")

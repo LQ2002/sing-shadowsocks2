@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"net"
+	"os"
 	"testing"
 	"time"
 	"unsafe"
@@ -153,8 +154,7 @@ func testGROReader(t *testing.T, check func(t *testing.T, reader N.ConnectedPack
 }
 
 func TestGROBatchReader(t *testing.T) {
-	enableUDPGRO = true
-	defer func() { enableUDPGRO = false }()
+	useReaders(t, false, true)
 	testGROReader(t, func(t *testing.T, reader N.ConnectedPacketBatchReadWaiter) {
 		if _, isGRO := reader.(*groBatchReader); !isGRO {
 			t.Fatal("SS2_UDP_GRO did not select the GRO reader")
@@ -163,9 +163,7 @@ func TestGROBatchReader(t *testing.T) {
 }
 
 func TestUringBatchReaderGRO(t *testing.T) {
-	enableUDPGRO = true
-	enableUDPIOUring = true
-	defer func() { enableUDPGRO, enableUDPIOUring = false, false }()
+	useReaders(t, true, true)
 	testGROReader(t, func(t *testing.T, reader N.ConnectedPacketBatchReadWaiter) {
 		uring, isUring := reader.(*uringBatchReader)
 		if !isUring {
@@ -173,6 +171,26 @@ func TestUringBatchReaderGRO(t *testing.T) {
 		}
 		if !uring.gro {
 			t.Fatal("io_uring reader without UDP_GRO")
+		}
+	})
+}
+
+// Without SS2_UDP_IOURING / SS2_UDP_GRO in the environment a connected
+// client gets the io_uring reader with UDP_GRO, the read path production uses.
+func TestDefaultReaderIsUringGRO(t *testing.T) {
+	if os.Getenv("SS2_UDP_IOURING") != "" || os.Getenv("SS2_UDP_GRO") != "" {
+		t.Skip("read path set by the environment")
+	}
+	testGROReader(t, func(t *testing.T, reader N.ConnectedPacketBatchReadWaiter) {
+		uring, isUring := reader.(*uringBatchReader)
+		if !isUring {
+			if !uringAvailable() {
+				t.Skip("io_uring unavailable")
+			}
+			t.Fatalf("default reader %T, want the io_uring reader", reader)
+		}
+		if !uring.gro {
+			t.Fatal("default io_uring reader without UDP_GRO")
 		}
 	})
 }

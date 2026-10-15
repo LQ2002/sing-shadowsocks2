@@ -18,7 +18,7 @@ import (
 )
 
 // groBatchReader is a recvmmsg reader for the client's connected UDP socket
-// with UDP_GRO enabled (experiment, SS2_UDP_GRO=1).
+// with UDP_GRO enabled (default on; SS2_UDP_GRO=0 turns it off).
 //
 // On the phone the NIC side already merges consecutive datagrams of a flow
 // before the stack sees them: on LTE rmnet/the modem hands up GSO skbs
@@ -43,7 +43,14 @@ import (
 // would get a merged datagram it cannot open. The batch read waiter is the
 // copy's reader for the whole session, so that holds in sing-box.
 
-var enableUDPGRO = os.Getenv("SS2_UDP_GRO") == "1"
+// On by default since 2026-10-16. On the phone (HTTP/3 download through
+// sing-box, 4 rounds each on WiFi and LTE, sing-box io_uring on in both) the
+// io_uring reader with GRO took sing-box CPU per MB 62% (WiFi) / 63% (LTE)
+// below the recvmmsg build, against 58% / 61% without GRO; whole-system busy
+// CPU per MB 52 vs 67 ms (WiFi), 47 vs 54 ms (LTE). This recvmmsg reader with
+// GRO is the fallback; alone it saved 5% on WiFi.
+// SS2_UDP_GRO=0 turns it off.
+var enableUDPGRO = os.Getenv("SS2_UDP_GRO") != "0"
 
 const (
 	groSlots       = 8
