@@ -1,0 +1,505 @@
+//go:build linux
+
+package shadowaead_2022
+
+import (
+	"io"
+	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"unsafe"
+
+	"github.com/sagernet/sing/common/buf"
+	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+
+	"golang.org/x/sys/unix"
+)
+
+// uringBatchReader is an io_uring alternative to keptBatchReader for the
+// client's connected UDP socket (experiment, opt-in: SS2_UDP_IOURING=1).
+//
+// One multishot IORING_OP_RECVMSG is armed on the socket with a provided
+// buffer ring, so every datagram that arrives lands in a ring buffer without
+// a read syscall of ours. The kernel does the receive in task_work of the
+// thread that armed it, so the reading goroutine is locked to one OS thread
+// while the reader is alive; when the completion queue is empty it blocks in
+// io_uring_enter(GETEVENTS), and an arriving datagram wakes that thread
+// (TWA_SIGNAL), which runs the receive and returns. Compared with the
+// recvmmsg reader there is no epoll wait through the Go netpoller and no
+// trailing recvmmsg that returns EAGAIN.
+//
+// SINGLE_ISSUER/DEFER_TASKRUN are not used: they would forbid the cancel
+// below from another thread.
+//
+// Payloads are copied out of the ring buffer into a packet buffer from the
+// copy loop's pool, and the ring buffer is handed back at once.
+//
+// Close: io_uring holds its own reference to the socket file, so closing the
+// fd would not end the armed receive, and shutdown(SHUT_RD) does not either
+// (a non-blocking UDP receive ignores RCV_SHUTDOWN and keeps returning
+// EAGAIN). clientPacketConn.Close therefore calls shutdown (closeHook): a
+// reader blocked in io_uring_enter gets an IORING_OP_ASYNC_CANCEL for its
+// receive and returns io.EOF; an idle reader's ring is closed outright.
+
+var enableUDPIOUring = os.Getenv("SS2_UDP_IOURING") == "1"
+
+const (
+	uringRecvTag     = 1
+	uringBufferGroup = 7
+	uringBufferCount = 64   // power of two
+	uringBufferSize  = 2048 // recvmsg_out header + one datagram
+	uringRecvOutSize = 16   // struct io_uring_recvmsg_out
+	uringSQEntries   = 8
+	uringCQEntries   = 256
+	sysIOURingSetup  = 425
+	sysIOURingEnter  = 426
+	sysIOURingReg    = 427
+	setupCQSize      = 1 << 3
+	featSingleMmap   = 1 << 0
+	enterGetEvents   = 1 << 0
+	opRecvMsg        = 10
+	opAsyncCancel    = 14
+	uringCancelTag   = 2
+	sqeBufferSelect  = 1 << 5
+	recvMultishot    = 1 << 1
+	cqeFBuffer       = 1 << 0
+	cqeFMore         = 1 << 1
+	cqeBufferShift   = 16
+	registerPbufRing = 22
+	unregisterPbuf   = 23
+	offSQRing        = 0
+	offSQEs          = 0x10000000
+)
+
+type uringSQOffsets struct {
+	head, tail, ringMask, ringEntries, flags, dropped, array, resv1 uint32
+	userAddr                                                        uint64
+}
+
+type uringCQOffsets struct {
+	head, tail, ringMask, ringEntries, overflow, cqes, flags, resv1 uint32
+	userAddr                                                        uint64
+}
+
+type uringParams struct {
+	sqEntries, cqEntries, flags, sqThreadCPU, sqThreadIdle, features, wqFD uint32
+	resv                                                                   [3]uint32
+	sqOff                                                                  uringSQOffsets
+	cqOff                                                                  uringCQOffsets
+}
+
+type uringSQE struct {
+	opcode      uint8
+	flags       uint8
+	ioprio      uint16
+	fd          int32
+	off         uint64
+	addr        uint64
+	len         uint32
+	opFlags     uint32
+	userData    uint64
+	bufGroup    uint16
+	personality uint16
+	spliceFD    int32
+	addr3       uint64
+	pad         uint64
+}
+
+type uringCQE struct {
+	userData uint64
+	res      int32
+	flags    uint32
+}
+
+type uringBufRegister struct {
+	ringAddr    uint64
+	ringEntries uint32
+	bgid        uint16
+	flags       uint16
+	resv        [3]uint64
+}
+
+type uringBuf struct {
+	addr uint64
+	len  uint32
+	bid  uint16
+	tail uint16 // only meaningful in entry 0: the ring tail
+}
+
+func init() {
+	var p uringParams
+	var sqe uringSQE
+	var reg uringBufRegister
+	if unsafe.Sizeof(p) != 120 || unsafe.Sizeof(sqe) != 64 || unsafe.Sizeof(reg) != 40 ||
+		unsafe.Sizeof(uringCQE{}) != 16 || unsafe.Sizeof(uringBuf{}) != 16 {
+		panic("shadowaead_2022: io_uring ABI size mismatch")
+	}
+}
+
+type uringBatchReader struct {
+	rawConn     syscall.RawConn
+	fd          int
+	destination M.Socksaddr
+	options     N.ReadWaitOptions
+
+	ringFD   int
+	ringMem  []byte
+	sqesMem  []byte
+	bufRing  []byte
+	slab     []byte
+	sqHead   *uint32
+	sqTail   *uint32
+	sqMask   uint32
+	sqArray  unsafe.Pointer
+	sqes     unsafe.Pointer
+	cqHead   *uint32
+	cqTail   *uint32
+	cqMask   uint32
+	cqes     unsafe.Pointer
+	bufTail  uint16
+	msghdr   unix.Msghdr
+	armed    bool
+	locked   bool
+	eof      bool
+	pending  []*buf.Buffer
+	closed   atomic.Bool
+	shutOnce sync.Once
+	// access guards the ring memory against release from another goroutine
+	// (shutdown via clientPacketConn.Close); inEnter marks the reader inside
+	// io_uring_enter, where it does not touch that memory.
+	access  sync.Mutex
+	inEnter bool
+}
+
+// newUringBatchReader returns the reader and the function the conn's Close
+// must call, or nil when SS2_UDP_IOURING is not set or the socket is not
+// connected.
+func newUringBatchReader(rawConn syscall.RawConn) (N.ConnectedPacketBatchReadWaiter, func()) {
+	if !enableUDPIOUring {
+		return nil, nil
+	}
+	var destination M.Socksaddr
+	fd := -1
+	err := rawConn.Control(func(rawFD uintptr) {
+		peer, peerErr := unix.Getpeername(int(rawFD))
+		if peerErr == nil {
+			destination = M.SocksaddrFromNetIP(M.AddrPortFromSockaddr(peer)).Unwrap()
+			fd = int(rawFD)
+		}
+	})
+	if err != nil || !destination.IsValid() || fd < 0 {
+		return nil, nil
+	}
+	reader := &uringBatchReader{rawConn: rawConn, fd: fd, destination: destination, ringFD: -1}
+	return reader, reader.shutdown
+}
+
+func (r *uringBatchReader) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	if options.BatchSize <= 0 {
+		options.BatchSize = 64
+	}
+	r.options = options
+	return false
+}
+
+// shutdown wakes a reader blocked in io_uring_enter; see the type comment.
+// When the reader is not inside io_uring_enter (its copy loop may already
+// have stopped calling it), the ring is released here so neither the ring
+// nor the socket reference it holds can leak.
+func (r *uringBatchReader) shutdown() {
+	r.closed.Store(true)
+	r.access.Lock()
+	defer r.access.Unlock()
+	if !r.inEnter {
+		r.release()
+		return
+	}
+	r.shutOnce.Do(func() {
+		r.pushSQE(uringSQE{opcode: opAsyncCancel, fd: -1, addr: uringRecvTag, userData: uringCancelTag})
+		toSubmit := atomic.LoadUint32(r.sqTail) - atomic.LoadUint32(r.sqHead)
+		_, _, _ = unix.Syscall6(sysIOURingEnter, uintptr(r.ringFD), uintptr(toSubmit), 0, 0, 0, 0)
+	})
+}
+
+func (r *uringBatchReader) setup() error {
+	var params uringParams
+	params.flags = setupCQSize
+	params.cqEntries = uringCQEntries
+	ringFD, _, errno := unix.RawSyscall(sysIOURingSetup, uringSQEntries, uintptr(unsafe.Pointer(&params)), 0)
+	if errno != 0 {
+		return os.NewSyscallError("io_uring_setup", errno)
+	}
+	r.ringFD = int(ringFD)
+	if params.features&featSingleMmap == 0 {
+		return E.New("io_uring without SINGLE_MMAP")
+	}
+	sqSize := params.sqOff.array + params.sqEntries*4
+	cqSize := params.cqOff.cqes + params.cqEntries*uint32(unsafe.Sizeof(uringCQE{}))
+	size := max(sqSize, cqSize)
+	ringMem, err := unix.Mmap(r.ringFD, offSQRing, int(size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
+	if err != nil {
+		return E.Cause(err, "mmap io_uring rings")
+	}
+	r.ringMem = ringMem
+	sqesMem, err := unix.Mmap(r.ringFD, offSQEs, int(params.sqEntries)*int(unsafe.Sizeof(uringSQE{})), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
+	if err != nil {
+		return E.Cause(err, "mmap io_uring sqes")
+	}
+	r.sqesMem = sqesMem
+	base := unsafe.Pointer(&ringMem[0])
+	r.sqHead = (*uint32)(unsafe.Add(base, params.sqOff.head))
+	r.sqTail = (*uint32)(unsafe.Add(base, params.sqOff.tail))
+	r.sqMask = *(*uint32)(unsafe.Add(base, params.sqOff.ringMask))
+	r.sqArray = unsafe.Add(base, params.sqOff.array)
+	r.sqes = unsafe.Pointer(&sqesMem[0])
+	r.cqHead = (*uint32)(unsafe.Add(base, params.cqOff.head))
+	r.cqTail = (*uint32)(unsafe.Add(base, params.cqOff.tail))
+	r.cqMask = *(*uint32)(unsafe.Add(base, params.cqOff.ringMask))
+	r.cqes = unsafe.Add(base, params.cqOff.cqes)
+
+	bufRing, err := unix.Mmap(-1, 0, uringBufferCount*int(unsafe.Sizeof(uringBuf{})), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
+	if err != nil {
+		return E.Cause(err, "mmap io_uring buffer ring")
+	}
+	r.bufRing = bufRing
+	r.slab = make([]byte, uringBufferCount*uringBufferSize)
+	reg := uringBufRegister{
+		ringAddr:    uint64(uintptr(unsafe.Pointer(&bufRing[0]))),
+		ringEntries: uringBufferCount,
+		bgid:        uringBufferGroup,
+	}
+	_, _, errno = unix.Syscall6(sysIOURingReg, uintptr(r.ringFD), registerPbufRing, uintptr(unsafe.Pointer(&reg)), 1, 0, 0)
+	if errno != 0 {
+		return os.NewSyscallError("io_uring_register(PBUF_RING)", errno)
+	}
+	for bid := range uringBufferCount {
+		r.provide(uint16(bid))
+	}
+	r.publishBuffers()
+	return nil
+}
+
+func (r *uringBatchReader) bufEntry(index uint16) *uringBuf {
+	return (*uringBuf)(unsafe.Add(unsafe.Pointer(&r.bufRing[0]), uintptr(index&(uringBufferCount-1))*unsafe.Sizeof(uringBuf{})))
+}
+
+// provide queues ring buffer bid for the kernel; publishBuffers makes the
+// queued entries visible by storing the new tail.
+func (r *uringBatchReader) provide(bid uint16) {
+	entry := r.bufEntry(r.bufTail)
+	entry.addr = uint64(uintptr(unsafe.Pointer(&r.slab[int(bid)*uringBufferSize])))
+	entry.len = uringBufferSize
+	// Entry 0's bid shares a 32-bit word with the ring tail; publishBuffers
+	// stores that word whole.
+	entry.bid = bid
+	r.bufTail++
+}
+
+func (r *uringBatchReader) publishBuffers() {
+	first := (*uringBuf)(unsafe.Pointer(&r.bufRing[0]))
+	word := uint32(first.bid) | uint32(r.bufTail)<<16
+	atomic.StoreUint32((*uint32)(unsafe.Add(unsafe.Pointer(&r.bufRing[0]), 12)), word)
+}
+
+// pushSQE queues one submission; access is held.
+func (r *uringBatchReader) pushSQE(entry uringSQE) {
+	tail := *r.sqTail
+	index := tail & r.sqMask
+	*(*uringSQE)(unsafe.Add(r.sqes, uintptr(index)*unsafe.Sizeof(uringSQE{}))) = entry
+	*(*uint32)(unsafe.Add(r.sqArray, uintptr(index)*4)) = index
+	atomic.StoreUint32(r.sqTail, tail+1)
+}
+
+func (r *uringBatchReader) arm() {
+	r.pushSQE(uringSQE{
+		opcode:   opRecvMsg,
+		flags:    sqeBufferSelect,
+		ioprio:   recvMultishot,
+		fd:       int32(r.fd),
+		addr:     uint64(uintptr(unsafe.Pointer(&r.msghdr))),
+		userData: uringRecvTag,
+		bufGroup: uringBufferGroup,
+	})
+	r.armed = true
+}
+
+// enter submits queued SQEs and, when wait is set, blocks until at least one
+// completion (running the deferred receive task_work in this thread).
+func (r *uringBatchReader) enter(wait bool) error {
+	toSubmit := atomic.LoadUint32(r.sqTail) - atomic.LoadUint32(r.sqHead)
+	var minComplete, flags uintptr
+	if wait {
+		minComplete, flags = 1, enterGetEvents
+	}
+	if toSubmit == 0 && !wait {
+		return nil
+	}
+	for {
+		ringFD := r.ringFD
+		r.inEnter = true
+		r.access.Unlock()
+		_, _, errno := unix.Syscall6(sysIOURingEnter, uintptr(ringFD), uintptr(toSubmit), minComplete, flags, 0, 0)
+		r.access.Lock()
+		r.inEnter = false
+		if r.ringFD < 0 {
+			return io.EOF
+		}
+		switch errno {
+		case 0:
+			return nil
+		case unix.EINTR, unix.EAGAIN, unix.EBUSY:
+			if !wait {
+				return nil
+			}
+			toSubmit = atomic.LoadUint32(r.sqTail) - atomic.LoadUint32(r.sqHead)
+			continue
+		default:
+			return os.NewSyscallError("io_uring_enter", errno)
+		}
+	}
+}
+
+// reap moves completed datagrams into r.pending. It returns an error for a
+// failed receive and sets r.eof when the socket was shut down.
+func (r *uringBatchReader) reap() error {
+	head := atomic.LoadUint32(r.cqHead)
+	tail := atomic.LoadUint32(r.cqTail)
+	provided := false
+	var reapErr error
+	for ; head != tail; head++ {
+		cqe := (*uringCQE)(unsafe.Add(r.cqes, uintptr(head&r.cqMask)*unsafe.Sizeof(uringCQE{})))
+		if cqe.userData != uringRecvTag {
+			continue // the cancel's own completion
+		}
+		if cqe.flags&cqeFMore == 0 {
+			r.armed = false
+		}
+		if cqe.flags&cqeFBuffer != 0 {
+			bid := uint16(cqe.flags >> cqeBufferShift)
+			if cqe.res >= uringRecvOutSize {
+				data := r.slab[int(bid)*uringBufferSize : int(bid)*uringBufferSize+int(cqe.res)]
+				payloadLen := int(*(*uint32)(unsafe.Pointer(&data[8])))
+				msgFlags := *(*uint32)(unsafe.Pointer(&data[12]))
+				if msgFlags&unix.MSG_TRUNC == 0 && uringRecvOutSize+payloadLen <= len(data) {
+					if payloadLen == 0 && r.closed.Load() {
+						r.eof = true
+					} else {
+						buffer := r.options.NewPacketBuffer()
+						if payloadLen <= buffer.FreeLen() {
+							copy(buffer.Extend(payloadLen), data[uringRecvOutSize:uringRecvOutSize+payloadLen])
+							r.options.PostReturn(buffer)
+							r.pending = append(r.pending, buffer)
+						} else {
+							buffer.Release()
+						}
+					}
+				}
+			}
+			r.provide(bid)
+			provided = true
+			continue
+		}
+		switch {
+		case cqe.res == 0, cqe.res == -int32(unix.ECANCELED):
+			r.eof = true
+		case cqe.res == -int32(unix.ENOBUFS):
+			// every ring buffer was in use; they are back now, re-arm
+		case cqe.res < 0:
+			if reapErr == nil {
+				reapErr = os.NewSyscallError("io_uring recvmsg", syscall.Errno(-cqe.res))
+			}
+		}
+	}
+	atomic.StoreUint32(r.cqHead, head)
+	if provided {
+		r.publishBuffers()
+	}
+	return reapErr
+}
+
+func (r *uringBatchReader) WaitReadConnectedPackets() (buffers []*buf.Buffer, destination M.Socksaddr, err error) {
+	r.access.Lock()
+	defer r.access.Unlock()
+	if r.ringFD < 0 {
+		if r.closed.Load() {
+			r.unlockThread()
+			return nil, M.Socksaddr{}, io.EOF
+		}
+		// SINGLE_ISSUER/DEFER_TASKRUN bind the ring to the creating thread.
+		runtime.LockOSThread()
+		r.locked = true
+		if err = r.setup(); err != nil {
+			r.Close()
+			return nil, M.Socksaddr{}, err
+		}
+	}
+	for {
+		if err = r.reap(); err != nil {
+			r.Close()
+			return nil, M.Socksaddr{}, err
+		}
+		if len(r.pending) > 0 {
+			count := min(len(r.pending), r.options.BatchSize)
+			buffers = make([]*buf.Buffer, count)
+			copy(buffers, r.pending[:count])
+			r.pending = append(r.pending[:0], r.pending[count:]...)
+			return buffers, r.destination, nil
+		}
+		if r.eof || r.closed.Load() {
+			r.Close()
+			return nil, M.Socksaddr{}, io.EOF
+		}
+		if !r.armed {
+			r.arm()
+		}
+		if err = r.enter(true); err != nil {
+			r.Close()
+			return nil, M.Socksaddr{}, err
+		}
+	}
+}
+
+// Close releases the ring and undoes the thread lock. It runs on the reading
+// goroutine with access held (after EOF or an error).
+func (r *uringBatchReader) Close() {
+	r.release()
+	r.unlockThread()
+}
+
+func (r *uringBatchReader) unlockThread() {
+	if r.locked {
+		r.locked = false
+		runtime.UnlockOSThread()
+	}
+}
+
+// release frees the ring, its memory and pending buffers; access is held.
+func (r *uringBatchReader) release() {
+	if r.ringFD >= 0 {
+		_ = unix.Close(r.ringFD)
+		r.ringFD = -1
+	}
+	if r.ringMem != nil {
+		_ = unix.Munmap(r.ringMem)
+		r.ringMem = nil
+	}
+	if r.sqesMem != nil {
+		_ = unix.Munmap(r.sqesMem)
+		r.sqesMem = nil
+	}
+	if r.bufRing != nil {
+		_ = unix.Munmap(r.bufRing)
+		r.bufRing = nil
+	}
+	buf.ReleaseMulti(r.pending)
+	r.pending = nil
+	r.closed.Store(true)
+}
+
+func (r *uringBatchReader) Upstream() any {
+	return r.rawConn
+}

@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	C "github.com/sagernet/sing-shadowsocks2/cipher"
@@ -368,6 +369,9 @@ type clientPacketConn struct {
 	writer  N.ExtendedWriter
 	method  *Method
 	session *udpSession
+	// closeHook is set by a batch reader that must be woken before the
+	// socket closes (the io_uring reader, packet_batch_read_uring_linux.go).
+	closeHook atomic.Pointer[func()]
 }
 
 func (m *Method) newUDPSession() *udpSession {
@@ -762,5 +766,8 @@ func (c *clientPacketConn) Upstream() any {
 }
 
 func (c *clientPacketConn) Close() error {
+	if hook := c.closeHook.Load(); hook != nil {
+		(*hook)()
+	}
 	return c.AbstractConn.Close()
 }

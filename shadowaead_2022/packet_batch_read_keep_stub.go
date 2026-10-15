@@ -13,3 +13,9 @@ import (
 func newKeptBatchReader(rawConn syscall.RawConn) N.ConnectedPacketBatchReadWaiter {
 	return nil
 }
+
+// newUringBatchReader: the io_uring reader is Linux only
+// (packet_batch_read_uring_linux.go).
+func newUringBatchReader(rawConn syscall.RawConn) (N.ConnectedPacketBatchReadWaiter, func()) {
+	return nil, nil
+}

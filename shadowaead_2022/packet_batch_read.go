@@ -49,6 +49,11 @@ func (c *clientPacketConn) CreatePacketBatchReadWaiter() (N.PacketBatchReadWaite
 	}
 	socketReader := &clientSocketReader{c.reader}
 	if rawConn, err := socketReader.SyscallConn(); err == nil {
+		// io_uring multishot receive, opt-in (packet_batch_read_uring_linux.go)
+		if reader, shutdown := newUringBatchReader(rawConn); reader != nil {
+			c.closeHook.Store(&shutdown)
+			return &clientPacketBatchReadWaiter{conn: c, reader: reader}, true
+		}
 		// keeps unfilled recvmmsg buffers (packet_batch_read_keep_linux.go)
 		if reader := newKeptBatchReader(rawConn); reader != nil {
 			return &clientPacketBatchReadWaiter{conn: c, reader: reader}, true
