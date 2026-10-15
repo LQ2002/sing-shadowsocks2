@@ -212,13 +212,34 @@ type uringBatchReader struct {
 	// io_uring_enter, where it does not touch that memory.
 	access  sync.Mutex
 	inEnter bool
+	// fallback is the recvmmsg reader this session uses after its ring
+	// could not be set up; only the reading goroutine touches it.
+	fallback N.ConnectedPacketBatchReadWaiter
+}
+
+// io_uring is probed once per process with the reader's own setup (ring,
+// mmaps, PBUF_RING registration): when the kernel lacks it, has it disabled
+// (io_uring_disabled), or the process may not use it, every session gets the
+// recvmmsg reader from the start.
+var uringProbe struct {
+	once sync.Once
+	ok   bool
+}
+
+func uringAvailable() bool {
+	uringProbe.once.Do(func() {
+		probe := &uringBatchReader{ringFD: -1, bufCount: 2, bufSize: uringBufferSize}
+		uringProbe.ok = probe.setup() == nil
+		probe.release()
+	})
+	return uringProbe.ok
 }
 
 // newUringBatchReader returns the reader and the function the conn's Close
 // must call, or nil when SS2_UDP_IOURING is not set or the socket is not
 // connected.
 func newUringBatchReader(rawConn syscall.RawConn) (N.ConnectedPacketBatchReadWaiter, func()) {
-	if !enableUDPIOUring {
+	if !enableUDPIOUring || !uringAvailable() {
 		return nil, nil
 	}
 	var destination M.Socksaddr
@@ -554,12 +575,45 @@ func (r *uringBatchReader) reap() error {
 }
 
 func (r *uringBatchReader) WaitReadConnectedPackets() (buffers []*buf.Buffer, destination M.Socksaddr, err error) {
+	for {
+		if r.fallback != nil {
+			// outside access: shutdown must not wait for a netpoller read
+			return r.fallback.WaitReadConnectedPackets()
+		}
+		var retry bool
+		buffers, destination, err, retry = r.waitRing()
+		if !retry {
+			return
+		}
+	}
+}
+
+// startFallback switches this session to the recvmmsg reader after its ring
+// could not be set up (UDP_GRO, if on, stays on: the GRO reader takes over).
+// It reports false when there is none to switch to.
+func (r *uringBatchReader) startFallback() bool {
+	var fallback N.ConnectedPacketBatchReadWaiter
+	if r.gro {
+		fallback = newGROBatchReader(r.rawConn)
+	}
+	if fallback == nil {
+		fallback = newKeptBatchReader(r.rawConn)
+	}
+	if fallback == nil {
+		return false
+	}
+	fallback.InitializeReadWaiter(r.options)
+	r.fallback = fallback
+	return true
+}
+
+func (r *uringBatchReader) waitRing() (buffers []*buf.Buffer, destination M.Socksaddr, err error, retry bool) {
 	r.access.Lock()
 	defer r.access.Unlock()
 	if r.ringFD < 0 {
 		if r.closed.Load() {
 			r.unlockThread()
-			return nil, M.Socksaddr{}, io.EOF
+			return nil, M.Socksaddr{}, io.EOF, false
 		}
 		// The receive task_work runs on the thread that armed it; the
 		// blocking variant keeps the reader on that thread.
@@ -568,32 +622,36 @@ func (r *uringBatchReader) WaitReadConnectedPackets() (buffers []*buf.Buffer, de
 			r.locked = true
 		}
 		if err = r.setup(); err != nil {
+			closed := r.closed.Load()
 			r.Close()
-			return nil, M.Socksaddr{}, err
+			if !closed && r.startFallback() {
+				return nil, M.Socksaddr{}, nil, true
+			}
+			return nil, M.Socksaddr{}, err, false
 		}
 	}
 	for {
 		if err = r.reap(); err != nil {
 			r.Close()
-			return nil, M.Socksaddr{}, err
+			return nil, M.Socksaddr{}, err, false
 		}
 		if len(r.pending) > 0 {
 			count := min(len(r.pending), r.options.BatchSize)
 			buffers = make([]*buf.Buffer, count)
 			copy(buffers, r.pending[:count])
 			r.pending = append(r.pending[:0], r.pending[count:]...)
-			return buffers, r.destination, nil
+			return buffers, r.destination, nil, false
 		}
 		if r.eof || r.closed.Load() {
 			r.Close()
-			return nil, M.Socksaddr{}, io.EOF
+			return nil, M.Socksaddr{}, io.EOF, false
 		}
 		if !r.armed {
 			r.arm()
 		}
 		if err = r.enter(true); err != nil {
 			r.Close()
-			return nil, M.Socksaddr{}, err
+			return nil, M.Socksaddr{}, err, false
 		}
 	}
 }

@@ -207,3 +207,40 @@ func TestUringBatchReaderNetpollVariants(t *testing.T) {
 		})
 	}
 }
+
+// A ring that cannot be set up (here: a buffer count the kernel rejects for
+// PBUF_RING) leaves the session on the recvmmsg reader instead of failing it,
+// and shutdown still ends the session.
+func TestUringBatchReaderFallsBackWhenSetupFails(t *testing.T) {
+	server, client, reader, shutdown := newUringTestPair(t)
+	defer server.Close()
+	defer client.Close()
+	reader.bufCount = 3 // not a power of two: io_uring_register fails
+	for i := range 5 {
+		if _, err := server.WriteTo(bytes.Repeat([]byte{byte(i)}, 100+i), client.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	got := 0
+	for got < 5 {
+		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		buffers, _, err := reader.WaitReadConnectedPackets()
+		if err != nil {
+			t.Fatalf("read after %d packets: %v", got, err)
+		}
+		got += len(buffers)
+		buf.ReleaseMulti(buffers)
+	}
+	if _, isKept := reader.fallback.(*keptBatchReader); !isKept {
+		t.Fatalf("fallback %T, want the recvmmsg reader", reader.fallback)
+	}
+	if reader.ringFD >= 0 {
+		t.Fatal("ring left open after the failed setup")
+	}
+	shutdown()
+	_ = client.Close()
+	if _, _, err := reader.WaitReadConnectedPackets(); err == nil {
+		t.Fatal("read after close succeeded")
+	}
+}

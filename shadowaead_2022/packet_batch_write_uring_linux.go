@@ -96,7 +96,7 @@ type uringConnectedWriter struct {
 
 // newUringConnectedWriter returns nil unless SS2_UDP_IOURING_SEND=1.
 func newUringConnectedWriter(rawConn syscall.RawConn, noGSO bool) *uringConnectedWriter {
-	if !enableUDPIOUringSend || rawConn == nil {
+	if !enableUDPIOUringSend || rawConn == nil || !uringAvailable() {
 		return nil
 	}
 	fd := -1
