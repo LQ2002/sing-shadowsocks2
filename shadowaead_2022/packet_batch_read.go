@@ -54,6 +54,10 @@ func (c *clientPacketConn) CreatePacketBatchReadWaiter() (N.PacketBatchReadWaite
 			c.closeHook.Store(&shutdown)
 			return &clientPacketBatchReadWaiter{conn: c, reader: reader}, true
 		}
+		// recvmmsg with UDP_GRO, opt-in (packet_batch_read_gro_linux.go)
+		if reader := newGROBatchReader(rawConn); reader != nil {
+			return &clientPacketBatchReadWaiter{conn: c, reader: reader}, true
+		}
 		// keeps unfilled recvmmsg buffers (packet_batch_read_keep_linux.go)
 		if reader := newKeptBatchReader(rawConn); reader != nil {
 			return &clientPacketBatchReadWaiter{conn: c, reader: reader}, true
