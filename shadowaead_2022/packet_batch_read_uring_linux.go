@@ -3,7 +3,9 @@
 package shadowaead_2022
 
 import (
+	"fmt"
 	"io"
+	"time"
 	"os"
 	"runtime"
 	"sync"
@@ -18,6 +20,8 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+var _ = fmt.Sprint
 
 // uringBatchReader is an io_uring alternative to keptBatchReader for the
 // client's connected UDP socket (experiment, opt-in: SS2_UDP_IOURING=1).
@@ -46,6 +50,14 @@ import (
 // receive and returns io.EOF; an idle reader's ring is closed outright.
 
 var enableUDPIOUring = os.Getenv("SS2_UDP_IOURING") == "1"
+
+var debugFile, _ = os.OpenFile("/data/local/tmp/ss2dbg.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+
+func debugf(format string, args ...any) {
+	if debugFile != nil {
+		fmt.Fprintf(debugFile, time.Now().Format("15:04:05.000 ")+format+"\n", args...)
+	}
+}
 
 // Wait variants (experiment). SS2_UDP_IOURING_WAIT=netpoll: the reader does
 // not lock its thread or block in io_uring_enter; the ring fd (pollable:
@@ -257,6 +269,7 @@ func (r *uringBatchReader) InitializeReadWaiter(options N.ReadWaitOptions) (need
 // have stopped calling it), the ring is released here so neither the ring
 // nor the socket reference it holds can leak.
 func (r *uringBatchReader) shutdown() {
+	debugf("%p shutdown inEnter=%v", r, r.inEnter)
 	r.closed.Store(true)
 	r.access.Lock()
 	defer r.access.Unlock()
@@ -489,6 +502,9 @@ func (r *uringBatchReader) reap() error {
 		if cqe.userData != uringRecvTag {
 			continue // the cancel's own completion
 		}
+		if cqe.flags&cqeFMore == 0 || cqe.res <= 0 {
+			debugf("%p cqe res=%d flags=%#x gro=%v pending=%d", r, cqe.res, cqe.flags, r.gro, len(r.pending))
+		}
 		if cqe.flags&cqeFMore == 0 {
 			r.armed = false
 		}
@@ -565,12 +581,14 @@ func (r *uringBatchReader) WaitReadConnectedPackets() (buffers []*buf.Buffer, de
 			r.locked = true
 		}
 		if err = r.setup(); err != nil {
+			debugf("%p setup err %v", r, err)
 			r.Close()
 			return nil, M.Socksaddr{}, err
 		}
 	}
 	for {
 		if err = r.reap(); err != nil {
+			debugf("%p reap err %v", r, err)
 			r.Close()
 			return nil, M.Socksaddr{}, err
 		}
@@ -582,6 +600,7 @@ func (r *uringBatchReader) WaitReadConnectedPackets() (buffers []*buf.Buffer, de
 			return buffers, r.destination, nil
 		}
 		if r.eof || r.closed.Load() {
+			debugf("%p eof=%v closed=%v", r, r.eof, r.closed.Load())
 			r.Close()
 			return nil, M.Socksaddr{}, io.EOF
 		}
@@ -589,6 +608,7 @@ func (r *uringBatchReader) WaitReadConnectedPackets() (buffers []*buf.Buffer, de
 			r.arm()
 		}
 		if err = r.enter(true); err != nil {
+			debugf("%p enter err %v", r, err)
 			r.Close()
 			return nil, M.Socksaddr{}, err
 		}
