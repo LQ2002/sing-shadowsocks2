@@ -39,7 +39,16 @@ func (c *clientPacketConn) CreatePacketBatchWriter() (N.PacketBatchWriter, bool)
 	if !isWriter {
 		return nil, false
 	}
-	writer, created := bufio.CreateConnectedPacketBatchWriter(&clientSocketWriter{conn})
+	socketWriter := &clientSocketWriter{conn}
+	// io_uring sendmsg instead of sendmmsg, opt-in (packet_batch_write_uring_linux.go)
+	if rawConn, err := socketWriter.SyscallConn(); err == nil {
+		if uringWriter := newUringConnectedWriter(rawConn, gsoDisabled(socketWriter)); uringWriter != nil {
+			closeWriter := uringWriter.Close
+			c.writerCloseHook.Store(&closeWriter)
+			return &clientPacketBatchWriter{conn: c, writer: uringWriter}, true
+		}
+	}
+	writer, created := bufio.CreateConnectedPacketBatchWriter(socketWriter)
 	if !created {
 		return nil, false
 	}

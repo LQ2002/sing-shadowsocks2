@@ -19,3 +19,15 @@ func newKeptBatchReader(rawConn syscall.RawConn) N.ConnectedPacketBatchReadWaite
 func newUringBatchReader(rawConn syscall.RawConn) (N.ConnectedPacketBatchReadWaiter, func()) {
 	return nil, nil
 }
+
+// uringConnectedWriter: the io_uring writer is Linux only
+// (packet_batch_write_uring_linux.go).
+type uringConnectedWriter struct{ N.ConnectedPacketBatchWriter }
+
+func (w *uringConnectedWriter) Close() {}
+
+func newUringConnectedWriter(rawConn syscall.RawConn, noGSO bool) *uringConnectedWriter {
+	return nil
+}
+
+func gsoDisabled(conn any) bool { return false }

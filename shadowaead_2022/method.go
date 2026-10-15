@@ -372,6 +372,9 @@ type clientPacketConn struct {
 	// closeHook is set by a batch reader that must be woken before the
 	// socket closes (the io_uring reader, packet_batch_read_uring_linux.go).
 	closeHook atomic.Pointer[func()]
+	// writerCloseHook releases the io_uring batch writer's ring
+	// (packet_batch_write_uring_linux.go).
+	writerCloseHook atomic.Pointer[func()]
 }
 
 func (m *Method) newUDPSession() *udpSession {
@@ -767,6 +770,9 @@ func (c *clientPacketConn) Upstream() any {
 
 func (c *clientPacketConn) Close() error {
 	if hook := c.closeHook.Load(); hook != nil {
+		(*hook)()
+	}
+	if hook := c.writerCloseHook.Load(); hook != nil {
 		(*hook)()
 	}
 	return c.AbstractConn.Close()
