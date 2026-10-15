@@ -190,3 +190,20 @@ func TestUringBatchReaderShutdownWhileIdleReleasesRing(t *testing.T) {
 	}
 	client.Close()
 }
+
+// The netpoll wait variant (with and without COOP_TASKRUN) must behave the
+// same: in-order reads, shutdown of a parked reader, release of an idle one.
+func TestUringBatchReaderNetpollVariants(t *testing.T) {
+	for _, variant := range []struct {
+		name string
+		coop bool
+	}{{"netpoll", false}, {"netpoll-coop", true}} {
+		t.Run(variant.name, func(t *testing.T) {
+			oldNetpoll, oldCoop := udpIOUringNetpoll, udpIOUringCoop
+			udpIOUringNetpoll, udpIOUringCoop = true, variant.coop
+			defer func() { udpIOUringNetpoll, udpIOUringCoop = oldNetpoll, oldCoop }()
+			t.Run("order", TestUringBatchReaderReadsInOrderAndStopsOnShutdown)
+			t.Run("idle", TestUringBatchReaderShutdownWhileIdleReleasesRing)
+		})
+	}
+}

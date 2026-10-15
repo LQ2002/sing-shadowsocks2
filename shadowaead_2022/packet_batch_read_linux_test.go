@@ -207,3 +207,12 @@ func TestClientPacketBatchReadKeepsBuffers(t *testing.T) {
 		}
 	}
 }
+
+// The blocking-ppoll control variant must read the same way.
+func TestClientPacketBatchReadBlockingVariant(t *testing.T) {
+	udpBlockingRead = true
+	defer func() { udpBlockingRead = false }()
+	t.Run("waiter", TestClientPacketBatchReadWaiter)
+	t.Run("all-invalid", TestClientPacketBatchReadWaiterAllInvalid)
+	t.Run("keeps-buffers", TestClientPacketBatchReadKeepsBuffers)
+}

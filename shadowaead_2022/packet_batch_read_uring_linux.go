@@ -47,6 +47,20 @@ import (
 
 var enableUDPIOUring = os.Getenv("SS2_UDP_IOURING") == "1"
 
+// Wait variants (experiment). SS2_UDP_IOURING_WAIT=netpoll: the reader does
+// not lock its thread or block in io_uring_enter; the ring fd (pollable:
+// EPOLLIN while completions are queued) is handed to the Go netpoller and
+// the goroutine parks there like on a socket. The receive task_work then
+// runs on whichever thread armed the multishot receive, which the kernel
+// wakes (TWA_SIGNAL) for every batch, so a batch costs that wake plus the
+// netpoller's; the variant trades that for no dedicated thread per reader.
+// SS2_UDP_IOURING_COOP=1 adds IORING_SETUP_COOP_TASKRUN (task_work notified
+// without an IPI; a sleeping arming thread is still woken).
+var (
+	udpIOUringNetpoll = os.Getenv("SS2_UDP_IOURING_WAIT") == "netpoll"
+	udpIOUringCoop    = os.Getenv("SS2_UDP_IOURING_COOP") == "1"
+)
+
 const (
 	uringRecvTag     = 1
 	uringBufferGroup = 7
@@ -59,6 +73,8 @@ const (
 	sysIOURingEnter  = 426
 	sysIOURingReg    = 427
 	setupCQSize      = 1 << 3
+	setupCoopTaskrun = 1 << 8
+	sqCQOverflow     = 1 << 1
 	featSingleMmap   = 1 << 0
 	enterGetEvents   = 1 << 0
 	opRecvMsg        = 10
@@ -146,21 +162,26 @@ type uringBatchReader struct {
 	destination M.Socksaddr
 	options     N.ReadWaitOptions
 
-	ringFD   int
-	ringMem  []byte
-	sqesMem  []byte
-	bufRing  []byte
-	slab     []byte
-	sqHead   *uint32
-	sqTail   *uint32
-	sqMask   uint32
-	sqArray  unsafe.Pointer
-	sqes     unsafe.Pointer
-	cqHead   *uint32
-	cqTail   *uint32
-	cqMask   uint32
-	cqes     unsafe.Pointer
-	bufTail  uint16
+	ringFD  int
+	ringMem []byte
+	sqesMem []byte
+	bufRing []byte
+	slab    []byte
+	sqHead  *uint32
+	sqTail  *uint32
+	sqMask  uint32
+	sqArray unsafe.Pointer
+	sqes    unsafe.Pointer
+	cqHead  *uint32
+	cqTail  *uint32
+	cqMask  uint32
+	cqes    unsafe.Pointer
+	sqFlags *uint32
+	bufTail uint16
+	// netpoll variant: the ring fd as an *os.File registered with the Go
+	// netpoller, and its RawConn
+	ringFile *os.File
+	ringRaw  syscall.RawConn
 	msghdr   unix.Msghdr
 	armed    bool
 	locked   bool
@@ -228,12 +249,28 @@ func (r *uringBatchReader) shutdown() {
 func (r *uringBatchReader) setup() error {
 	var params uringParams
 	params.flags = setupCQSize
+	if udpIOUringCoop {
+		params.flags |= setupCoopTaskrun
+	}
 	params.cqEntries = uringCQEntries
 	ringFD, _, errno := unix.RawSyscall(sysIOURingSetup, uringSQEntries, uintptr(unsafe.Pointer(&params)), 0)
 	if errno != 0 {
 		return os.NewSyscallError("io_uring_setup", errno)
 	}
 	r.ringFD = int(ringFD)
+	if udpIOUringNetpoll {
+		if err := unix.SetNonblock(r.ringFD, true); err != nil {
+			return E.Cause(err, "set io_uring fd non-blocking")
+		}
+		// os.File owns the fd from here on; release closes it through the
+		// file so the netpoller lets go of it first.
+		r.ringFile = os.NewFile(uintptr(r.ringFD), "io_uring")
+		ringRaw, err := r.ringFile.SyscallConn()
+		if err != nil {
+			return E.Cause(err, "io_uring fd raw conn")
+		}
+		r.ringRaw = ringRaw
+	}
 	if params.features&featSingleMmap == 0 {
 		return E.New("io_uring without SINGLE_MMAP")
 	}
@@ -260,6 +297,7 @@ func (r *uringBatchReader) setup() error {
 	r.cqTail = (*uint32)(unsafe.Add(base, params.cqOff.tail))
 	r.cqMask = *(*uint32)(unsafe.Add(base, params.cqOff.ringMask))
 	r.cqes = unsafe.Add(base, params.cqOff.cqes)
+	r.sqFlags = (*uint32)(unsafe.Add(base, params.sqOff.flags))
 
 	bufRing, err := unix.Mmap(-1, 0, uringBufferCount*int(unsafe.Sizeof(uringBuf{})), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
 	if err != nil {
@@ -338,6 +376,9 @@ func (r *uringBatchReader) enter(wait bool) error {
 	if toSubmit == 0 && !wait {
 		return nil
 	}
+	if r.ringRaw != nil {
+		return r.enterNetpoll(toSubmit, wait)
+	}
 	for {
 		ringFD := r.ringFD
 		r.inEnter = true
@@ -361,6 +402,51 @@ func (r *uringBatchReader) enter(wait bool) error {
 			return os.NewSyscallError("io_uring_enter", errno)
 		}
 	}
+}
+
+// enterNetpoll is enter for the netpoll variant: submit without waiting,
+// then park the goroutine in the Go netpoller until the ring fd reports
+// queued completions.
+func (r *uringBatchReader) enterNetpoll(toSubmit uint32, wait bool) error {
+	if toSubmit > 0 {
+		for {
+			_, _, errno := unix.Syscall6(sysIOURingEnter, uintptr(r.ringFD), uintptr(toSubmit), 0, 0, 0, 0)
+			if errno == unix.EINTR {
+				continue
+			}
+			if errno != 0 && errno != unix.EAGAIN && errno != unix.EBUSY {
+				return os.NewSyscallError("io_uring_enter", errno)
+			}
+			break
+		}
+	}
+	if !wait {
+		return nil
+	}
+	ringFD := r.ringFD
+	r.inEnter = true
+	r.access.Unlock()
+	err := r.ringRaw.Read(func(uintptr) bool {
+		if atomic.LoadUint32(r.cqHead) != atomic.LoadUint32(r.cqTail) {
+			return true
+		}
+		// Completions that did not fit the CQ wait in the kernel's
+		// overflow list until an io_uring_enter(GETEVENTS) flushes them.
+		if atomic.LoadUint32(r.sqFlags)&sqCQOverflow != 0 {
+			_, _, _ = unix.Syscall6(sysIOURingEnter, uintptr(ringFD), 0, 0, enterGetEvents, 0, 0)
+			return atomic.LoadUint32(r.cqHead) != atomic.LoadUint32(r.cqTail)
+		}
+		return false
+	})
+	r.access.Lock()
+	r.inEnter = false
+	if r.ringFD < 0 {
+		return io.EOF
+	}
+	if err != nil {
+		return E.Cause(err, "wait io_uring completions")
+	}
+	return nil
 }
 
 // reap moves completed datagrams into r.pending. It returns an error for a
@@ -429,9 +515,12 @@ func (r *uringBatchReader) WaitReadConnectedPackets() (buffers []*buf.Buffer, de
 			r.unlockThread()
 			return nil, M.Socksaddr{}, io.EOF
 		}
-		// SINGLE_ISSUER/DEFER_TASKRUN bind the ring to the creating thread.
-		runtime.LockOSThread()
-		r.locked = true
+		// The receive task_work runs on the thread that armed it; the
+		// blocking variant keeps the reader on that thread.
+		if !udpIOUringNetpoll {
+			runtime.LockOSThread()
+			r.locked = true
+		}
 		if err = r.setup(); err != nil {
 			r.Close()
 			return nil, M.Socksaddr{}, err
@@ -479,7 +568,12 @@ func (r *uringBatchReader) unlockThread() {
 
 // release frees the ring, its memory and pending buffers; access is held.
 func (r *uringBatchReader) release() {
-	if r.ringFD >= 0 {
+	if r.ringFile != nil {
+		_ = r.ringFile.Close()
+		r.ringFile = nil
+		r.ringRaw = nil
+		r.ringFD = -1
+	} else if r.ringFD >= 0 {
 		_ = unix.Close(r.ringFD)
 		r.ringFD = -1
 	}

@@ -5,6 +5,7 @@ package shadowaead_2022
 import (
 	"io"
 	"os"
+	"runtime"
 	"syscall"
 	"unsafe"
 
@@ -36,6 +37,18 @@ import (
 
 var disableUDPKeepBuffers = os.Getenv("SS2_DISABLE_UDP_KEEP_BUFFERS") == "1"
 
+// SS2_UDP_BLOCKING=1 (experiment, the control for the io_uring readers):
+// the reading goroutine is locked to its thread and, when recvmmsg finds the
+// socket empty, waits in a blocking ppoll on it instead of the Go netpoller,
+// so an arriving datagram wakes this thread directly, as io_uring's blocking
+// wait does, but every batch still costs a ppoll and a recvmmsg. After
+// blockingPollTimeout without data it falls back to the netpoller (so an
+// idle socket costs no periodic wakeups and Close, which wakes netpoller
+// waiters only, is noticed within that time).
+var udpBlockingRead = os.Getenv("SS2_UDP_BLOCKING") == "1"
+
+const blockingPollTimeout = 500 // milliseconds
+
 type keptMmsghdr struct {
 	hdr unix.Msghdr
 	n   uint32
@@ -51,6 +64,7 @@ type keptBatchReader struct {
 	readN       int
 	readErr     error
 	readFunc    func(fd uintptr) (done bool)
+	locked      bool
 }
 
 // newKeptBatchReader returns a reader for the connected socket behind
@@ -107,6 +121,13 @@ func (r *keptBatchReader) read(fd uintptr) (done bool) {
 		case syscall.EINTR:
 			continue
 		case syscall.EAGAIN:
+			if udpBlockingRead {
+				fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+				n, pollErr := unix.Ppoll(fds, &unix.Timespec{Nsec: blockingPollTimeout * 1e6}, nil)
+				if pollErr == nil && n > 0 && fds[0].Revents&unix.POLLIN != 0 {
+					continue
+				}
+			}
 			// unfilled buffers stay for the next call
 			return false
 		default:
@@ -127,14 +148,20 @@ func (r *keptBatchReader) read(fd uintptr) (done bool) {
 }
 
 func (r *keptBatchReader) WaitReadConnectedPackets() (buffers []*buf.Buffer, destination M.Socksaddr, err error) {
+	if udpBlockingRead && !r.locked {
+		runtime.LockOSThread()
+		r.locked = true
+	}
 	err = r.rawConn.Read(r.readFunc)
 	if err != nil {
 		r.releaseBuffers()
+		r.unlockThread()
 		return
 	}
 	if r.readErr != nil {
 		readErr := r.readErr
 		r.releaseBuffers()
+		r.unlockThread()
 		if readErr == io.EOF {
 			return nil, M.Socksaddr{}, io.EOF
 		}
@@ -148,6 +175,13 @@ func (r *keptBatchReader) WaitReadConnectedPackets() (buffers []*buf.Buffer, des
 	}
 	r.readN = 0
 	return buffers, r.destination, nil
+}
+
+func (r *keptBatchReader) unlockThread() {
+	if r.locked {
+		r.locked = false
+		runtime.UnlockOSThread()
+	}
 }
 
 func (r *keptBatchReader) releaseBuffers() {
