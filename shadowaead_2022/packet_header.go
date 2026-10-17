@@ -38,3 +38,17 @@ func shortRead(buffer *buf.Buffer) error {
 	buffer.Advance(buffer.Len())
 	return io.ErrUnexpectedEOF
 }
+
+// writeUint64 and writeUint16 append a big-endian field without
+// binary.Write, which boxes the value into an interface and allocates a
+// scratch slice per call (encoding/binary.encodeFast was ~0.7% of sing-box
+// CPU in a paced UDP upload on the phone, 2026-10-17). They panic like
+// common.Must(binary.Write(...)) did when the buffer has no room.
+
+func writeUint64(buffer *buf.Buffer, value uint64) {
+	binary.BigEndian.PutUint64(buffer.Extend(8), value)
+}
+
+func writeUint16(buffer *buf.Buffer, value uint16) {
+	binary.BigEndian.PutUint16(buffer.Extend(2), value)
+}

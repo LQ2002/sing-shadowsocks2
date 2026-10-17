@@ -53,3 +53,52 @@ func BenchmarkClientReadPacketHeader(b *testing.B) {
 		}
 	})
 }
+
+// writeUint64/writeUint16 produce the bytes binary.Write produces, after
+// whatever the buffer already holds.
+func TestWriteUintMatchesBinaryWrite(t *testing.T) {
+	for _, value := range []uint64{0, 1, 0x0123456789abcdef, ^uint64(0)} {
+		want := buf.NewSize(32)
+		_, _ = want.Write([]byte{0xaa})
+		if err := binary.Write(want, binary.BigEndian, value); err != nil {
+			t.Fatal(err)
+		}
+		if err := binary.Write(want, binary.BigEndian, uint16(value)); err != nil {
+			t.Fatal(err)
+		}
+		got := buf.NewSize(32)
+		_, _ = got.Write([]byte{0xaa})
+		writeUint64(got, value)
+		writeUint16(got, uint16(value))
+		if !bytes.Equal(got.Bytes(), want.Bytes()) {
+			t.Fatalf("%x: got %x, want %x", value, got.Bytes(), want.Bytes())
+		}
+		got.Release()
+		want.Release()
+	}
+}
+
+func BenchmarkClientWritePacketHeader(b *testing.B) {
+	b.Run("binary.Write", func(b *testing.B) {
+		b.ReportAllocs()
+		buffer := buf.NewSize(64)
+		defer buffer.Release()
+		for i := 0; i < b.N; i++ {
+			buffer.Reset()
+			_ = binary.Write(buffer, binary.BigEndian, uint64(i))
+			_ = binary.Write(buffer, binary.BigEndian, uint64(i))
+			_ = binary.Write(buffer, binary.BigEndian, uint16(i))
+		}
+	})
+	b.Run("direct", func(b *testing.B) {
+		b.ReportAllocs()
+		buffer := buf.NewSize(64)
+		defer buffer.Release()
+		for i := 0; i < b.N; i++ {
+			buffer.Reset()
+			writeUint64(buffer, uint64(i))
+			writeUint64(buffer, uint64(i))
+			writeUint16(buffer, uint16(i))
+		}
+	})
+}

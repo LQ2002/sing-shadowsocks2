@@ -455,10 +455,8 @@ func (c *clientPacketConn) sealPacket(buffer *buf.Buffer, destination M.Socksadd
 		dataIndex = aes.BlockSize
 	}
 
-	common.Must(
-		binary.Write(header, binary.BigEndian, c.session.sessionId),
-		binary.Write(header, binary.BigEndian, c.session.nextPacketId()),
-	)
+	writeUint64(header, c.session.sessionId)
+	writeUint64(header, c.session.nextPacketId())
 
 	if c.method.udpCipher == nil && pskLen > 1 {
 		for i, psk := range c.method.pskList {
@@ -478,11 +476,9 @@ func (c *clientPacketConn) sealPacket(buffer *buf.Buffer, destination M.Socksadd
 			}
 		}
 	}
-	common.Must(
-		header.WriteByte(HeaderTypeClient),
-		binary.Write(header, binary.BigEndian, uint64(c.method.time().Unix())),
-		binary.Write(header, binary.BigEndian, uint16(paddingLen)), // padding length
-	)
+	common.Must(header.WriteByte(HeaderTypeClient))
+	writeUint64(header, uint64(c.method.time().Unix()))
+	writeUint16(header, uint16(paddingLen)) // padding length
 
 	if paddingLen > 0 {
 		header.Extend(paddingLen)
@@ -707,10 +703,8 @@ func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		dataIndex = aes.BlockSize
 	}
 
-	common.Must(
-		binary.Write(buffer, binary.BigEndian, c.session.sessionId),
-		binary.Write(buffer, binary.BigEndian, c.session.nextPacketId()),
-	)
+	writeUint64(buffer, c.session.sessionId)
+	writeUint64(buffer, c.session.nextPacketId())
 
 	if c.method.udpCipher == nil && pskLen > 1 {
 		for i, psk := range c.method.pskList {
@@ -730,11 +724,9 @@ func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			}
 		}
 	}
-	common.Must(
-		buffer.WriteByte(HeaderTypeClient),
-		binary.Write(buffer, binary.BigEndian, uint64(c.method.time().Unix())),
-		binary.Write(buffer, binary.BigEndian, uint16(paddingLen)), // padding length
-	)
+	common.Must(buffer.WriteByte(HeaderTypeClient))
+	writeUint64(buffer, uint64(c.method.time().Unix()))
+	writeUint16(buffer, uint16(paddingLen)) // padding length
 
 	if paddingLen > 0 {
 		buffer.Extend(paddingLen)
