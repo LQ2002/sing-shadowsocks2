@@ -484,7 +484,7 @@ func (c *clientPacketConn) sealPacket(buffer *buf.Buffer, destination M.Socksadd
 		header.Extend(paddingLen)
 	}
 
-	err := M.SocksaddrSerializer.WriteAddrPort(header, destination)
+	err := writeSocksaddr(header, destination)
 	if err != nil {
 		return err
 	}
@@ -637,7 +637,7 @@ func (c *clientPacketConn) readPacket(buffer *buf.Buffer) (destination M.Socksad
 	}
 	buffer.Advance(int(paddingLen))
 
-	destination, err = M.SocksaddrSerializer.ReadAddrPort(buffer)
+	destination, err = readSocksaddr(buffer)
 	if err != nil {
 		return
 	}
@@ -732,7 +732,7 @@ func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		buffer.Extend(paddingLen)
 	}
 
-	err = M.SocksaddrSerializer.WriteAddrPort(buffer, destination)
+	err = writeSocksaddr(buffer, destination)
 	if err != nil {
 		return
 	}

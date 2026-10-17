@@ -3,9 +3,14 @@ package shadowaead_2022
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"math/rand"
+	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/sagernet/sing/common/buf"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 // readUint64/readUint16 return what binary.Read returns, with the same
@@ -99,6 +104,99 @@ func BenchmarkClientWritePacketHeader(b *testing.B) {
 			writeUint64(buffer, uint64(i))
 			writeUint64(buffer, uint64(i))
 			writeUint16(buffer, uint16(i))
+		}
+	})
+}
+
+// readSocksaddr must return exactly what M.SocksaddrSerializer.ReadAddrPort
+// returns (address, error text, bytes consumed) for any input; the inputs
+// cover every type byte, every truncation and random tails.
+func TestReadSocksaddrMatchesSerializer(t *testing.T) {
+	seeds := [][]byte{
+		{0x01, 1, 2, 3, 4, 0x01, 0xbb},
+		{0x04, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x00, 0x35},
+		{0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 8, 8, 8, 8, 0x00, 0x35}, // IPv4-mapped
+		append(append([]byte{0x03, 11}, "example.com"...), 0x01, 0xbb),
+		append(append([]byte{0x03, 7}, "1.2.3.4"...), 0x00, 0x50), // domain that parses as an IP
+		append(append([]byte{0x03, 5}, "[::1]"...), 0x00, 0x50),
+		{0x03, 0, 0x00, 0x50},
+		{0x00, 1, 2},
+		{0x02, 1, 2, 3, 4, 5, 6},
+		{},
+	}
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < 2000; i++ {
+		random := make([]byte, rng.Intn(40))
+		rng.Read(random)
+		if len(random) > 0 && rng.Intn(2) == 0 {
+			random[0] = []byte{0x01, 0x03, 0x04}[rng.Intn(3)]
+		}
+		seeds = append(seeds, random)
+	}
+	for _, seed := range seeds {
+		for n := 0; n <= len(seed); n++ {
+			input := append(seed[:n:n], 0xee) // a trailing byte must stay unread
+			want := buf.As(append([]byte(nil), input...))
+			wantAddr, wantErr := M.SocksaddrSerializer.ReadAddrPort(want)
+			got := buf.As(append([]byte(nil), input...))
+			gotAddr, gotErr := readSocksaddr(got)
+			if fmt.Sprint(gotErr) != fmt.Sprint(wantErr) || gotAddr != wantAddr || got.Len() != want.Len() {
+				t.Fatalf("input %x: got %v/%v/%d left, want %v/%v/%d left", input, gotAddr, gotErr, got.Len(), wantAddr, wantErr, want.Len())
+			}
+		}
+	}
+}
+
+// writeSocksaddr must write exactly what the Serializer writes, including
+// when the buffer runs out of room.
+func TestWriteSocksaddrMatchesSerializer(t *testing.T) {
+	long := strings.Repeat("a", 255)
+	addresses := []M.Socksaddr{
+		M.ParseSocksaddr("1.2.3.4:443"),
+		M.ParseSocksaddr("[2001:db8::1]:53"),
+		{Addr: netip.MustParseAddr("::ffff:8.8.8.8"), Port: 53},
+		{Fqdn: "example.com", Port: 443},
+		{Fqdn: long, Port: 1},
+		{Fqdn: long + "a", Port: 1},
+		{Fqdn: "x", Addr: netip.MustParseAddr("9.9.9.9"), Port: 9},
+		{},
+		{Port: 80},
+	}
+	for _, address := range addresses {
+		for capacity := 0; capacity <= 270; capacity++ {
+			want := buf.NewSize(capacity)
+			wantErr := M.SocksaddrSerializer.WriteAddrPort(want, address)
+			got := buf.NewSize(capacity)
+			gotErr := writeSocksaddr(got, address)
+			if fmt.Sprint(gotErr) != fmt.Sprint(wantErr) || !bytes.Equal(got.Bytes(), want.Bytes()) {
+				t.Fatalf("%v cap %d: got %x/%v, want %x/%v", address, capacity, got.Bytes(), gotErr, want.Bytes(), wantErr)
+			}
+			got.Release()
+			want.Release()
+		}
+	}
+}
+
+func BenchmarkSocksaddr(b *testing.B) {
+	address := M.ParseSocksaddr("1.2.3.4:443")
+	b.Run("Serializer", func(b *testing.B) {
+		b.ReportAllocs()
+		buffer := buf.NewSize(64)
+		defer buffer.Release()
+		for i := 0; i < b.N; i++ {
+			buffer.Reset()
+			_ = M.SocksaddrSerializer.WriteAddrPort(buffer, address)
+			_, _ = M.SocksaddrSerializer.ReadAddrPort(buffer)
+		}
+	})
+	b.Run("direct", func(b *testing.B) {
+		b.ReportAllocs()
+		buffer := buf.NewSize(64)
+		defer buffer.Release()
+		for i := 0; i < b.N; i++ {
+			buffer.Reset()
+			_ = writeSocksaddr(buffer, address)
+			_, _ = readSocksaddr(buffer)
 		}
 	})
 }
