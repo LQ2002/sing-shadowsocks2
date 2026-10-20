@@ -32,8 +32,16 @@ import (
 // recvmmsg reader there is no epoll wait through the Go netpoller and no
 // trailing recvmmsg that returns EAGAIN.
 //
-// SINGLE_ISSUER/DEFER_TASKRUN are not used: they would forbid the cancel
-// below from another thread.
+// SINGLE_ISSUER/DEFER_TASKRUN are off by default: with them only the reading
+// thread may submit to the ring, so the cancel below cannot be sent from the
+// closing goroutine. SS2_UDP_IOURING_DEFER=1 (experiment, blocking variant
+// only) turns them on and replaces that cancel with a wake: shutdown posts a
+// completion to the reader's ring with IORING_OP_MSG_RING from a shared
+// helper ring, and the reader, back on its own thread, sees closed and
+// releases the ring (closing the ring ends the armed receive). With
+// DEFER_TASKRUN the receive task_work is not signalled to the thread; it is
+// queued and run inside the reader's io_uring_enter(GETEVENTS), which is
+// woken when a completion is ready.
 //
 // Payloads are copied out of the ring buffer into a packet buffer from the
 // copy loop's pool, and the ring buffer is handed back at once.
@@ -70,6 +78,7 @@ var enableUDPIOUring = os.Getenv("SS2_UDP_IOURING") != "0"
 var (
 	udpIOUringNetpoll = os.Getenv("SS2_UDP_IOURING_WAIT") == "netpoll"
 	udpIOUringCoop    = os.Getenv("SS2_UDP_IOURING_COOP") == "1"
+	udpIOUringDefer   = os.Getenv("SS2_UDP_IOURING_DEFER") == "1"
 )
 
 const (
@@ -80,29 +89,33 @@ const (
 	// UDP_GRO: recvmsg_out header + reserved cmsg room + a merged datagram
 	uringGROBufferCount = 8 // power of two
 	uringGROBufferSize  = uringRecvOutSize + groControlSize + groSlotSize
-	uringRecvOutSize = 16   // struct io_uring_recvmsg_out
-	uringSQEntries   = 8
-	uringCQEntries   = 256
-	sysIOURingSetup  = 425
-	sysIOURingEnter  = 426
-	sysIOURingReg    = 427
-	setupCQSize      = 1 << 3
-	setupCoopTaskrun = 1 << 8
-	sqCQOverflow     = 1 << 1
-	featSingleMmap   = 1 << 0
-	enterGetEvents   = 1 << 0
-	opRecvMsg        = 10
-	opAsyncCancel    = 14
-	uringCancelTag   = 2
-	sqeBufferSelect  = 1 << 5
-	recvMultishot    = 1 << 1
-	cqeFBuffer       = 1 << 0
-	cqeFMore         = 1 << 1
-	cqeBufferShift   = 16
-	registerPbufRing = 22
-	unregisterPbuf   = 23
-	offSQRing        = 0
-	offSQEs          = 0x10000000
+	uringRecvOutSize    = 16 // struct io_uring_recvmsg_out
+	uringSQEntries      = 8
+	uringCQEntries      = 256
+	sysIOURingSetup     = 425
+	sysIOURingEnter     = 426
+	sysIOURingReg       = 427
+	setupCQSize         = 1 << 3
+	setupCoopTaskrun    = 1 << 8
+	sqCQOverflow        = 1 << 1
+	featSingleMmap      = 1 << 0
+	enterGetEvents      = 1 << 0
+	opRecvMsg           = 10
+	opAsyncCancel       = 14
+	opMsgRing           = 40
+	uringCancelTag      = 2
+	uringWakeTag        = 3
+	setupSingleIssuer   = 1 << 12
+	setupDeferTaskrun   = 1 << 13
+	sqeBufferSelect     = 1 << 5
+	recvMultishot       = 1 << 1
+	cqeFBuffer          = 1 << 0
+	cqeFMore            = 1 << 1
+	cqeBufferShift      = 16
+	registerPbufRing    = 22
+	unregisterPbuf      = 23
+	offSQRing           = 0
+	offSQEs             = 0x10000000
 )
 
 type uringSQOffsets struct {
@@ -206,6 +219,9 @@ type uringBatchReader struct {
 	msghdr   unix.Msghdr
 	armed    bool
 	locked   bool
+	// deferred: the ring was set up with SINGLE_ISSUER|DEFER_TASKRUN, so
+	// shutdown wakes the reader with MSG_RING instead of submitting a cancel
+	deferred bool
 	eof      bool
 	pending  []*buf.Buffer
 	closed   atomic.Bool
@@ -289,6 +305,10 @@ func (r *uringBatchReader) shutdown() {
 		return
 	}
 	r.shutOnce.Do(func() {
+		if r.deferred {
+			uringWake(r.ringFD)
+			return
+		}
 		r.pushSQE(uringSQE{opcode: opAsyncCancel, fd: -1, addr: uringRecvTag, userData: uringCancelTag})
 		toSubmit := atomic.LoadUint32(r.sqTail) - atomic.LoadUint32(r.sqHead)
 		_, _, _ = unix.Syscall6(sysIOURingEnter, uintptr(r.ringFD), uintptr(toSubmit), 0, 0, 0, 0)
@@ -302,11 +322,27 @@ func (r *uringBatchReader) setup() error {
 		params.flags |= setupCoopTaskrun
 	}
 	params.cqEntries = uringCQEntries
+	// The ring's submitter is the thread that creates it: setup runs on the
+	// reader's locked thread (waitRing), never in the probe. A wake needs
+	// the shared helper ring, so without one the reader stays non-deferred.
+	deferred := udpIOUringDefer && r.locked && uringWakerAvailable()
+	if deferred {
+		params.flags |= setupSingleIssuer | setupDeferTaskrun
+	}
 	ringFD, _, errno := unix.RawSyscall(sysIOURingSetup, uringSQEntries, uintptr(unsafe.Pointer(&params)), 0)
+	if errno == unix.EINVAL && deferred {
+		deferred = false
+		params = uringParams{flags: setupCQSize, cqEntries: uringCQEntries}
+		if udpIOUringCoop {
+			params.flags |= setupCoopTaskrun
+		}
+		ringFD, _, errno = unix.RawSyscall(sysIOURingSetup, uringSQEntries, uintptr(unsafe.Pointer(&params)), 0)
+	}
 	if errno != 0 {
 		return os.NewSyscallError("io_uring_setup", errno)
 	}
 	r.ringFD = int(ringFD)
+	r.deferred = deferred
 	if udpIOUringNetpoll {
 		if err := unix.SetNonblock(r.ringFD, true); err != nil {
 			return E.Cause(err, "set io_uring fd non-blocking")

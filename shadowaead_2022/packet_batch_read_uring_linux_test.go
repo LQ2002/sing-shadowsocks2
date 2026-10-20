@@ -207,6 +207,41 @@ func TestUringBatchReaderNetpollVariants(t *testing.T) {
 	}
 }
 
+// SS2_UDP_IOURING_DEFER: the ring really is SINGLE_ISSUER|DEFER_TASKRUN, and
+// reads, the MSG_RING wake of a blocked reader on shutdown and the release
+// of an idle one behave as in the default variant.
+func TestUringBatchReaderDeferVariant(t *testing.T) {
+	oldDefer := udpIOUringDefer
+	udpIOUringDefer = true
+	defer func() { udpIOUringDefer = oldDefer }()
+	t.Run("deferred", func(t *testing.T) {
+		server, client, reader, shutdown := newUringTestPair(t)
+		defer server.Close()
+		defer client.Close()
+		if _, err := server.WriteTo([]byte("x"), client.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+		buffers, _, err := reader.WaitReadConnectedPackets()
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.ReleaseMulti(buffers)
+		if !reader.deferred {
+			t.Skip("kernel rejected SINGLE_ISSUER|DEFER_TASKRUN")
+		}
+		// a closer on another thread wakes the blocked reader
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			shutdown()
+		}()
+		if _, _, err = reader.WaitReadConnectedPackets(); err != io.EOF {
+			t.Fatalf("after shutdown: %v, want io.EOF", err)
+		}
+	})
+	t.Run("order", TestUringBatchReaderReadsInOrderAndStopsOnShutdown)
+	t.Run("idle", TestUringBatchReaderShutdownWhileIdleReleasesRing)
+}
+
 // A ring that cannot be set up (here: a buffer count the kernel rejects for
 // PBUF_RING) leaves the session on the recvmmsg reader instead of failing it,
 // and shutdown still ends the session.
